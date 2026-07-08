@@ -1,0 +1,95 @@
+# Python bytecode and build output
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+wheelhouse/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Local editor and agent settings
+.vscode/
+.idea/
+.claude/settings.local.json
+.codex/
+
+# Data and artifacts
+/data/
+/runs/
+/artifacts/
+/feature_cache/
+/reports/
+/logs/
+/models/
+/checkpoints/
+/outputs/
+/mlruns/
+/wandb/
+/lightning_logs/
+events.out.tfevents*
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.pickle
+*.joblib
+*.log
+
+# Local backups
+*.bak
+*.backup
+*.tmp
+*.swp
+.pre_quanthelion_migration_backup/
+
+# Secrets and broker credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+*.key
+*.pem
+*.crt
+*.p12
+secrets.yaml
+secrets.yml
+credentials.yaml
+credentials.yml
+
+# OS
+.DS_Store
+._*
+Thumbs.db
+desktop.ini

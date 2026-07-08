@@ -1,0 +1,36 @@
+# Upstox-only data source allowlist.
+#
+# Every model feature must either be fetched from Upstox or causally derived from
+# these Upstox payloads. Non-Upstox macro, news, vendor depth, social, and broker
+# alternatives are intentionally absent.
+#
+# Raw Upstox-sourced paths (ohlcv_5m, futures_ohlcv_5m, india_vix) now live in the
+# shared alpha_data lake (../alpha_data/data/), not this repo's own data/ — see
+# alpha_data/docs/DATA_CATALOG.md. This file's `path` values are documentation only
+# (provenance.py checks each source's `provider`, never reads `path`).
+sources:
+  ohlcv_5m:
+    provider: upstox
+    tier: v1
+    format: parquet
+    path: ../alpha_data/data/ohlcv/
+  futures_ohlcv_5m:
+    provider: upstox
+    tier: v1
+    format: parquet
+    path: ../alpha_data/data/ohlcv/
+  futures_continuous:
+    provider: derived_from_upstox
+    tier: v1
+    format: parquet
+    path: data/processed/banknifty_5min.parquet
+  india_vix:
+    provider: upstox
+    tier: v1
+    format: parquet
+    path: ../alpha_data/data/ohlcv/INDIAVIX_5min.parquet
+  labels:
+    provider: derived_from_upstox
+    tier: v1
+    format: parquet
+    path: data/processed/labels.parquet

@@ -1,0 +1,20 @@
+# BankNIFTY walk-forward backtest (SPEC.md §23). Inherits v1.yaml conceptually; overrides below.
+extends: configs/v1.yaml
+backtest:
+  symbol: BANKNIFTY
+  start: "2023-01-01"
+  end: "2025-12-31"
+  n_folds: 6
+  embargo_bars: 192
+  risk_profile: banknifty_futures_conservative
+  apply_costs: true
+  apply_slippage: true
+  partial_fills: true
+  event_stress_test: true
+  expiry_stress_test: true
+  regime_breakdown: true
+report:
+  separate_gross_net: true
+  no_trade_quality: true
+  risk_shield_interventions: true
+  cost_decomposition: true

@@ -1,0 +1,10 @@
+# Small model variant (Mac Studio 64GB default). SPEC.md §29.
+model:
+  size: small
+  latent_dim: 128
+  temporal_layers: 2
+  futures_conv_layers: 2
+  cross_asset_heads: 4
+  fusion: gated
+  rollout_samples: 16
+  dropout: 0.1

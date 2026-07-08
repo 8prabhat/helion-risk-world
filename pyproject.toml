@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "helion_risk_world"
+version = "0.1.0"
+description = "Tri-Plane Risk-Aware Market World Model for Indian index/derivatives research"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Prabhat" }]
+
+# NOTE: `quanthelion` is a *local editable* framework dependency during development:
+#   pip install -e ../quanthelion
+# It is intentionally NOT pinned from an index here. Keep it editable-installed.
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "polars>=0.20",
+    "pyarrow>=15.0",
+    "scikit-learn>=1.4",
+    "structlog>=24.1",
+    "rich>=13.7",
+    "click>=8.1",
+    "python-dateutil>=2.9",
+    "pytz>=2024.1",
+    # torch is required but left to the user's platform wheel (MPS on Mac Studio):
+    #   pip install torch  (CPU/MPS build)
+    "torch>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "black>=24.0",
+    "mypy>=1.10",
+    "pyright>=1.1",
+]
+
+[project.scripts]
+hrw-build-features = "helion_risk_world.scripts_entry:build_features"
+hrw-train = "helion_risk_world.scripts_entry:train"
+hrw-backtest = "helion_risk_world.scripts_entry:backtest"
+hrw-paper = "helion_risk_world.scripts_entry:paper_trade"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "TID"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true   # quanthelion is editable-installed; relax third-party stubs
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning"]

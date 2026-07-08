@@ -1,0 +1,13 @@
+# Medium model variant. SPEC.md §29. Heavier; still runnable on Mac Studio with grad accumulation.
+model:
+  size: medium
+  latent_dim: 256
+  temporal_layers: 4
+  futures_conv_layers: 3
+  cross_asset_heads: 8
+  fusion: moe
+  rollout_samples: 32
+  dropout: 0.1
+training:
+  batch_size: 128
+  grad_accum_steps: 2

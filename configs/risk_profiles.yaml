@@ -1,0 +1,74 @@
+# Account risk profiles for counterfactual Portfolio World simulation (SPEC.md §14, §18).
+# These are PORTFOLIO-plane only — never market features.
+profiles:
+  small_low_risk:
+    capital0: 50000
+    max_risk_per_trade: 0.005
+    max_daily_loss: 0.01
+    max_weekly_loss: 0.03
+    max_drawdown: 0.05
+    max_exposure: 0.5
+    max_trades_per_day: 3
+    consecutive_loss_cooldown: 2
+    cvar_alpha: 0.05
+    n_paths: 256
+
+  balanced:
+    capital0: 500000
+    max_risk_per_trade: 0.01
+    max_daily_loss: 0.02
+    max_weekly_loss: 0.05
+    max_drawdown: 0.10
+    max_exposure: 1.0
+    max_trades_per_day: 10
+    consecutive_loss_cooldown: 4
+    cvar_alpha: 0.05
+    n_paths: 256
+
+  banknifty_futures_conservative:
+    capital0: 2500000
+    max_risk_per_trade: 0.005
+    max_daily_loss: 0.015
+    max_weekly_loss: 0.04
+    max_drawdown: 0.08
+    max_exposure: 1.0
+    max_trades_per_day: 8
+    consecutive_loss_cooldown: 4
+    cvar_alpha: 0.05
+    n_paths: 384
+
+  large_conservative:
+    capital0: 5000000
+    max_risk_per_trade: 0.005
+    max_daily_loss: 0.015
+    max_weekly_loss: 0.04
+    max_drawdown: 0.08
+    max_exposure: 0.75
+    max_trades_per_day: 6
+    consecutive_loss_cooldown: 3
+    cvar_alpha: 0.025
+    n_paths: 512
+
+  aggressive:
+    capital0: 500000
+    max_risk_per_trade: 0.03
+    max_daily_loss: 0.05
+    max_weekly_loss: 0.10
+    max_drawdown: 0.20
+    max_exposure: 2.0
+    max_trades_per_day: 20
+    consecutive_loss_cooldown: 5
+    cvar_alpha: 0.05
+    n_paths: 256
+
+  in_drawdown:
+    capital0: 500000
+    max_risk_per_trade: 0.005
+    max_daily_loss: 0.01
+    max_weekly_loss: 0.02
+    max_drawdown: 0.10
+    max_exposure: 0.5
+    max_trades_per_day: 3
+    consecutive_loss_cooldown: 6
+    cvar_alpha: 0.025
+    n_paths: 512

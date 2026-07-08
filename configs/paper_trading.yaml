@@ -1,0 +1,13 @@
+# Paper trading (SPEC.md §24). Dry-run only — never sends real orders. Every decision is audited.
+extends: configs/v1.yaml
+paper:
+  symbol: BANKNIFTY
+  broker_adapter: execution_reality  # cost-aware dry-run simulation; never sends real orders
+  risk_profile: banknifty_futures_conservative
+  log_every_decision: true       # full FinalDecision audit record
+  calibration_monitor: true
+  data_monitor: true          # stale/skewed data blocks new risk; exits/reductions still pass
+  drift_monitor: true
+  decision_log_path: runs/paper/decisions.jsonl
+  execution_log_path: runs/paper/executions.jsonl
+  monitor_report_path: runs/paper/monitor_summary.json
