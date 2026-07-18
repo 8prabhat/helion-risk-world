@@ -28,6 +28,15 @@ BARRIER_TARGET_MULT_COLUMN = "barrier_target_mult"
 BARRIER_VOL_SPAN_COLUMN = "barrier_vol_span"
 BARRIER_COST_FLOOR_COLUMN = "barrier_cost_floor_frac"
 
+# Meta-labeling columns (2026-07-18, see labeling/meta_labels.py): a momentum-based
+# PRIMARY signal proposes a trade side; the META label is the binary, cost-aware
+# question "would taking a trade in that direction, held via the same triple-barrier
+# exit mechanics, have netted more than round-trip cost." Trains a dedicated
+# MetaLabelHead as a trade-quality GATE on top of the existing barrier/quantile
+# machinery, rather than replacing it outright (see docs/investigation_log.md).
+PRIMARY_SIDE_COLUMN = "primary_side"
+META_LABEL_COLUMN = "meta_label"
+
 
 class LabelRecord(BaseModel):
     """Triple-barrier label for one entry bar. NEVER a feature (label_realized_at > ts)."""
@@ -92,6 +101,22 @@ class LabelRecord(BaseModel):
         default=None, ge=0.0, le=1.0,
         description="Sample uniqueness ū_i; None until apply_uniqueness_weights is called.",
     )
+    primary_side: int = Field(
+        default=0, ge=-1, le=1,
+        description=(
+            "Momentum-based primary signal's proposed side at decision time: "
+            "+1 long, -1 short, 0 = no signal (flat trailing momentum; excluded from "
+            "meta-label training). See labeling/meta_labels.py."
+        ),
+    )
+    meta_label: int | None = Field(
+        default=None, ge=0, le=1,
+        description=(
+            "1 if taking a trade in primary_side's direction nets more than round-trip "
+            "cost via the same triple-barrier exit path; 0 otherwise. None when "
+            "primary_side == 0 (no trade proposed, no profitability question to label)."
+        ),
+    )
 
     @model_validator(mode="after")
     def _future_only(self) -> LabelRecord:
@@ -141,6 +166,8 @@ __all__ = [
     "BARRIER_TARGET_MULT_COLUMN",
     "BARRIER_TARGET_RETURN_COLUMN",
     "BARRIER_VOL_SPAN_COLUMN",
+    "META_LABEL_COLUMN",
+    "PRIMARY_SIDE_COLUMN",
     "Barrier",
     "LabelRecord",
     "horizon_mae_column",

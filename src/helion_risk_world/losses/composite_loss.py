@@ -18,6 +18,7 @@ from torch import Tensor, nn
 from helion_risk_world.config.model_config import LossWeights
 from helion_risk_world.losses.quantile_calibration import soft_coverage_loss
 from helion_risk_world.losses.quantile_loss import DEFAULT_QUANTILES, QuantileLoss
+from helion_risk_world.losses.repr_loss import _offdiag_cov, _var_hinge
 
 _DIRECTION_BAND = 1e-3
 _DIRECTION_SCALE_FLOOR = 5e-4
@@ -107,6 +108,20 @@ class ForecasterLoss(nn.Module):
             "calibration": float(c_loss.detach()),
             "uncertainty": float(u_loss.detach()),
         }
+
+        # Anti-collapse regularization on z (feature-onboarding follow-up, 2026-07-12): without
+        # this, supervised fine-tuning collapses z to ~1 effective dimension (empirically
+        # confirmed -- see losses/repr_loss.py's docstring for the same VICReg terms Stage-2
+        # pretraining uses to keep z well-spread; that regularization previously stopped the
+        # moment supervised training started). Applied whenever the batch has >1 row (variance/
+        # covariance are undefined for a batch of 1).
+        z = prediction.get("z")
+        if z is not None and z.shape[0] > 1 and (self._w.repr_var or self._w.repr_cov):
+            var_loss = _var_hinge(z)
+            cov_loss = _offdiag_cov(z)
+            total = total + self._w.repr_var * var_loss + self._w.repr_cov * cov_loss
+            self.last_components["repr_var"] = float(var_loss.detach())
+            self.last_components["repr_cov"] = float(cov_loss.detach())
 
         # Direction — optional: only applied if the model still has a direction head.
         direction = self._get(target, "direction")
@@ -211,8 +226,19 @@ class ForecasterLoss(nn.Module):
                 total = total + coherence_weight * coherence_loss
                 self.last_components["excursion_coherence"] = float(coherence_loss.detach())
 
+        # Decomposed barrier architecture (2026-07-13): when the model is run in
+        # barrier_mode="decomposed", `barrier_logits` is still populated (as
+        # log(p_stop/target/timeout), reconstructed from touch_logit/direction_logit for
+        # backward compatibility with downstream softmax consumers) but it's a DETERMINISTIC
+        # function of those two heads' own outputs -- applying the old 3-way CE terms
+        # (excursion_barrier, barrier) on top would double-supervise the same computation
+        # graph through a redundant path. Skip both old terms in that mode; the touch/
+        # direction terms below are the only barrier supervision.
+        is_decomposed = "touch_logit" in prediction and "direction_logit" in prediction
+
         if (
-            geometry is not None
+            not is_decomposed
+            and geometry is not None
             and mae is not None
             and mfe is not None
             and "barrier_logits" in prediction
@@ -251,7 +277,7 @@ class ForecasterLoss(nn.Module):
             self.last_components["excursion_barrier"] = float(excursion_barrier_loss.detach())
 
         barrier = self._get(target, "barrier")
-        if barrier is not None and "barrier_logits" in prediction:
+        if not is_decomposed and barrier is not None and "barrier_logits" in prediction:
             barrier_weight = self._get(target, "barrier_weight")
             effective_weights = weights
             if barrier_weight is not None:
@@ -275,6 +301,71 @@ class ForecasterLoss(nn.Module):
             )
             total = total + self._w.barrier * b_loss
             self.last_components["barrier"] = float(b_loss.detach())
+
+        if is_decomposed and barrier is not None:
+            # barrier: 0=stop, 1=target, 2=timeout (see schemas/label_schema.py::Barrier).
+            barrier_flat = barrier.reshape(-1)
+            barrier_weight = self._get(target, "barrier_weight")
+            effective_weights = weights
+            if barrier_weight is not None:
+                barrier_weight = barrier_weight.reshape(-1)
+                effective_weights = (
+                    barrier_weight
+                    if effective_weights is None
+                    else effective_weights * barrier_weight
+                )
+
+            touch_label = (barrier_flat != 2).to(dtype=prediction["touch_logit"].dtype)
+            touch_loss = self._reduce(
+                F.binary_cross_entropy_with_logits(
+                    prediction["touch_logit"], touch_label, reduction="none"
+                ),
+                effective_weights,
+            )
+            total = total + self._w.barrier_touch * touch_loss
+            self.last_components["barrier_touch"] = float(touch_loss.detach())
+
+            # Direction is only defined conditional on touch -- mask timeout rows out of the
+            # direction loss entirely (zero weight), rather than supervising a meaningless
+            # "up vs down" label on rows where neither barrier was hit.
+            touched_mask = (barrier_flat != 2).to(dtype=prediction["direction_logit"].dtype)
+            direction_weights = (
+                touched_mask if effective_weights is None else effective_weights * touched_mask
+            )
+            direction_label = (barrier_flat == 1).to(dtype=prediction["direction_logit"].dtype)
+            direction_loss = self._reduce(
+                F.binary_cross_entropy_with_logits(
+                    prediction["direction_logit"], direction_label, reduction="none"
+                ),
+                direction_weights,
+            )
+            total = total + self._w.barrier_direction * direction_loss
+            self.last_components["barrier_direction"] = float(direction_loss.detach())
+
+        # Meta-label head (2026-07-18, see heads/meta_label_head.py + labeling/meta_labels.py):
+        # binary "is a trade in the primary side's direction worth taking, net of cost."
+        # `meta_label` is NaN (via labeling/meta_labels.py's sentinel-then-NaN-on-write
+        # convention, see alpha_labels.py) wherever primary_side == 0 -- no trade was ever
+        # proposed for that row, so there's no profitability question to supervise. Those
+        # rows get their BCE input sanitized to a dummy 0.0 (never fed to backward with a
+        # real gradient contribution) AND zero sample weight, the same masking pattern
+        # `direction_weights` uses above for touch-conditional rows -- NaN * 0 is still NaN,
+        # so the label must be replaced, not just down-weighted.
+        meta_label = self._get(target, "meta_label")
+        if meta_label is not None and "meta_label_logit" in prediction:
+            meta_logit = prediction["meta_label_logit"]
+            meta_label = meta_label.reshape(-1).to(dtype=meta_logit.dtype)
+            valid_mask = torch.isfinite(meta_label)
+            safe_label = torch.where(valid_mask, meta_label, torch.zeros_like(meta_label))
+            meta_weights = valid_mask.to(dtype=meta_logit.dtype)
+            if weights is not None:
+                meta_weights = meta_weights * weights.to(dtype=meta_logit.dtype)
+            ml_loss = self._reduce(
+                F.binary_cross_entropy_with_logits(meta_logit, safe_label, reduction="none"),
+                meta_weights,
+            )
+            total = total + self._w.meta_label * ml_loss
+            self.last_components["meta_label"] = float(ml_loss.detach())
 
         self.last_components["total"] = float(total.detach())
         return total

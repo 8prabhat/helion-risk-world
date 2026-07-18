@@ -95,6 +95,15 @@ class OptionSurfaceSnapshot(BaseModel):
     expiry_pressure: float | None = None
     atm_iv: float | None = None
     wing_iv: float | None = None
+    # 2026-07-15: added after the feature IC diagnostic found these to be the single
+    # strongest directional signal in a 124-feature evaluation (rank #1/#2 by |IC|
+    # against both forward return and barrier-edge, fold-stable across all 5
+    # chronological folds -- runs/feature_ic_report_expanded.csv). Locally computed
+    # from the ATM strike row's own call_delta/put_delta as a fallback, overridden by
+    # alpha_data's dedicated rolling-ATM greeks series when available (same pattern as
+    # atm_iv above -- see AlphaDataAtmGreeksLoader).
+    atm_call_delta: float | None = None
+    atm_put_delta: float | None = None
 
     @model_validator(mode="after")
     def _pit_and_symmetry(self) -> OptionSurfaceSnapshot:

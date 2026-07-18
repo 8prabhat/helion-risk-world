@@ -72,7 +72,7 @@ def _steps(horizon: int, mean: float, realized: float) -> list[BacktestStep]:
 def test_strategy_comparison_runner_produces_ranked_summary() -> None:
     cases = [
         StrategyBacktestCase(get_strategy_profile("scalping"), _steps(3, 0.08, 0.03)),
-        StrategyBacktestCase(get_strategy_profile("medium_frequency"), _steps(192, 0.04, 0.02)),
+        StrategyBacktestCase(get_strategy_profile("medium_frequency"), _steps(48, 0.04, 0.02)),
     ]
 
     report = StrategyComparisonRunner.default().run(cases, _account(), RISK)

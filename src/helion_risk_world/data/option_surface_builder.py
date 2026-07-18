@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import statistics
 from datetime import datetime
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -19,6 +20,20 @@ from helion_risk_world.schemas.option_chain_schema import (
     OptionType,
     StrikeRow,
 )
+
+
+@runtime_checkable
+class SurfaceStatsSource(Protocol):
+    """Point-in-time surface-derived-stats lookup (e.g. ``AlphaDataSurfaceStatsLoader``)."""
+
+    def get(self, underlying: str, ts: datetime) -> dict[str, float | None] | None: ...
+
+
+@runtime_checkable
+class AtmGreeksSource(Protocol):
+    """Point-in-time ATM call/put delta lookup (e.g. ``AlphaDataAtmGreeksLoader``)."""
+
+    def get(self, underlying: str, ts: datetime) -> dict[str, float | None] | None: ...
 
 # Canonical model-input layout for the option surface (kept in one place; DRY).
 # Per-strike channels (the "set" the OptionSurfaceEncoder pools over). OI/volume are normalised to
@@ -32,6 +47,9 @@ SURFACE_STRIKE_CHANNELS: tuple[str, ...] = (
 SURFACE_CONTEXT_FEATURES: tuple[str, ...] = (
     "pcr", "iv_skew", "gamma_concentration", "call_wall_strength", "put_wall_strength",
     "oi_wall_strength", "max_pain_rel", "atm_iv", "wing_iv", "dte_norm",
+    # 2026-07-15: rank #1/#2 of 124 features by |IC| in the full feature evaluation
+    # (runs/feature_ic_report_expanded.csv) -- see OptionSurfaceSnapshot's docstring.
+    "atm_call_delta", "atm_put_delta",
 )
 
 
@@ -55,10 +73,23 @@ class OptionSurfaceBuilder:
     never silently dropped.
     """
 
-    def __init__(self, n_strikes: int = 5) -> None:
+    def __init__(
+        self, n_strikes: int = 5, *,
+        stats_source: SurfaceStatsSource | None = None,
+        atm_greeks_source: AtmGreeksSource | None = None,
+    ) -> None:
         if n_strikes < 1:
             raise ValueError("n_strikes must be >= 1")
         self._n_strikes = n_strikes
+        # Optional alpha_data-backed override for the derived surface stats this class
+        # would otherwise recompute locally (feature-onboarding pass) -- see
+        # ``AlphaDataSurfaceStatsLoader``'s docstring. None (the default) keeps this class
+        # fully generic/data-source-agnostic, as documented above.
+        self._stats_source = stats_source
+        # Optional alpha_data-backed override for atm_call_delta/atm_put_delta (2026-07-15
+        # feature-evaluation pass) -- see ``AlphaDataAtmGreeksLoader``'s docstring. Same
+        # generic/data-source-agnostic default as stats_source above.
+        self._atm_greeks_source = atm_greeks_source
 
     def align_to_atm(
         self, chain: list[OptionContractSnapshot], spot: float, ts: datetime
@@ -135,6 +166,7 @@ class OptionSurfaceBuilder:
         dte = float(statistics.median([c.dte for c in selected]))
 
         derived = self._derived_features(rows, atm, step)
+        derived = self._apply_stats_override(derived, underlying, ts)
         return OptionSurfaceSnapshot(
             underlying=underlying,
             ts=ts,
@@ -166,11 +198,13 @@ class OptionSurfaceBuilder:
         grand = sum(oi_totals)
         oi_wall = (max(oi_totals) / grand) if grand > 0 else None
 
-        # ATM IV / wing IV / skew.
+        # ATM IV / wing IV / skew / delta.
         atm_row = next((r for r in rows if r.token == 0), None)
         atm_pair = (atm_row.call_iv, atm_row.put_iv) if atm_row else ()
         atm_ivs = [v for v in atm_pair if v is not None]
         atm_iv = float(np.mean(atm_ivs)) if atm_ivs else None
+        atm_call_delta = atm_row.call_delta if atm_row else None
+        atm_put_delta = atm_row.put_delta if atm_row else None
         wing_ivs = [
             v
             for r in rows
@@ -213,7 +247,75 @@ class OptionSurfaceBuilder:
             "expiry_pressure": expiry_pressure,
             "atm_iv": atm_iv,
             "wing_iv": wing_iv,
+            "atm_call_delta": atm_call_delta,
+            "atm_put_delta": atm_put_delta,
         }
+
+    def _apply_stats_override(
+        self, derived: dict[str, float | None], underlying: str, ts: datetime
+    ) -> dict[str, float | None]:
+        """Override locally-recomputed derived stats with alpha_data's precomputed
+        surface stats when available (feature-onboarding pass; see
+        ``AlphaDataSurfaceStatsLoader``), and atm_call_delta/atm_put_delta with
+        alpha_data's dedicated rolling-ATM greeks series when available (2026-07-15,
+        see ``AlphaDataAtmGreeksLoader``). ``iv_skew`` is never overridden -- alpha_data's
+        ``compute_surface_stats`` doesn't produce it. Falls back to the local value
+        (unchanged) for any field alpha_data doesn't have for this cycle/bar, so partial
+        stats coverage degrades gracefully rather than silently zero-filling.
+        """
+        merged = dict(derived)
+        if self._atm_greeks_source is not None:
+            atm_override = self._atm_greeks_source.get(underlying, ts)
+            if atm_override:
+                merged["atm_call_delta"] = (
+                    atm_override.get("atm_call_delta")
+                    if atm_override.get("atm_call_delta") is not None
+                    else derived["atm_call_delta"]
+                )
+                merged["atm_put_delta"] = (
+                    atm_override.get("atm_put_delta")
+                    if atm_override.get("atm_put_delta") is not None
+                    else derived["atm_put_delta"]
+                )
+        if self._stats_source is None:
+            return merged
+        override = self._stats_source.get(underlying, ts)
+        if not override:
+            return merged
+        merged["pcr"] = override.get("pcr") if override.get("pcr") is not None else derived["pcr"]
+        merged["gamma_concentration"] = (
+            override.get("gamma_concentration")
+            if override.get("gamma_concentration") is not None
+            else derived["gamma_concentration"]
+        )
+        merged["call_wall_strength"] = (
+            override.get("call_wall_strength")
+            if override.get("call_wall_strength") is not None
+            else derived["call_wall_strength"]
+        )
+        merged["put_wall_strength"] = (
+            override.get("put_wall_strength")
+            if override.get("put_wall_strength") is not None
+            else derived["put_wall_strength"]
+        )
+        merged["oi_wall_strength"] = (
+            override.get("oi_wall_strength")
+            if override.get("oi_wall_strength") is not None
+            else derived["oi_wall_strength"]
+        )
+        merged["max_pain_proxy"] = (
+            override.get("max_pain") if override.get("max_pain") is not None else derived["max_pain_proxy"]
+        )
+        merged["expiry_pressure"] = (
+            override.get("expiry_pressure")
+            if override.get("expiry_pressure") is not None
+            else derived["expiry_pressure"]
+        )
+        merged["atm_iv"] = override.get("atm_iv") if override.get("atm_iv") is not None else derived["atm_iv"]
+        merged["wing_iv"] = (
+            override.get("wing_iv") if override.get("wing_iv") is not None else derived["wing_iv"]
+        )
+        return merged
 
     @staticmethod
     def _max_pain(rows: list[StrikeRow]) -> float | None:
@@ -294,6 +396,8 @@ def featurize_surface(
             snapshot.atm_iv or 0.0,
             snapshot.wing_iv or 0.0,
             snapshot.dte / 30.0,
+            snapshot.atm_call_delta or 0.0,
+            snapshot.atm_put_delta or 0.0,
         ],
         dtype=np.float32,
     )

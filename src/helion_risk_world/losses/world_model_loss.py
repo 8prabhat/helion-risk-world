@@ -18,6 +18,7 @@ from helion_risk_world.losses.composite_loss import (
 )
 from helion_risk_world.losses.quantile_calibration import soft_coverage_loss
 from helion_risk_world.losses.quantile_loss import DEFAULT_QUANTILES
+from helion_risk_world.losses.repr_loss import _offdiag_cov, _var_hinge
 
 
 class WorldModelLoss(nn.Module):
@@ -111,6 +112,19 @@ class WorldModelLoss(nn.Module):
             "volatility": float(v_loss.detach()),
             "calibration": float(c_loss.detach()),
         }
+
+        # Anti-collapse regularization on z -- see composite_loss.py::ForecasterLoss's identical
+        # term for the full rationale (empirically confirmed z collapse to ~1 effective
+        # dimension under supervised fine-tuning without this).
+        z = prediction.get("z")
+        if isinstance(z, Tensor) and z.shape[0] > 1 and (
+            self._weights.repr_var or self._weights.repr_cov
+        ):
+            var_loss = _var_hinge(z)
+            cov_loss = _offdiag_cov(z)
+            total = total + self._weights.repr_var * var_loss + self._weights.repr_cov * cov_loss
+            self.last_components["repr_var"] = float(var_loss.detach())
+            self.last_components["repr_cov"] = float(cov_loss.detach())
 
         if self._weights.direction != 0.0:
             # World-model training is multi-horizon [B, H]. The legacy target.direction field is

@@ -23,7 +23,27 @@ from helion_risk_world.prediction_calibration import PredictionCalibration
 FORECASTER_ARTIFACT_KIND = "hrw_forecaster"
 WORLD_MODEL_ARTIFACT_KIND = "hrw_world_model"
 ARTIFACT_KIND = FORECASTER_ARTIFACT_KIND
-ARTIFACT_VERSION = 13  # v13: Upstox-only provenance + persisted barrier horizon/cost contract.
+ARTIFACT_VERSION = 16  # v16: SURFACE_CONTEXT_FEATURES widened 10->12 — added
+# atm_call_delta/atm_put_delta (rank #1/#2 of 124 features by |IC| in the full feature
+# evaluation, runs/feature_ic_report_expanded.csv), sourced from alpha_data's dedicated
+# rolling-ATM greeks series via AlphaDataAtmGreeksLoader, with a local fallback computed
+# from the surface grid's own ATM-token row. OptionSurfaceEncoder's context input width
+# changes (n_context = len(SURFACE_CONTEXT_FEATURES)) — breaks state_dict compatibility
+# with v15 checkpoints (shape change this time, not just a semantics change).
+# v15: candle plane columns 27-29 replaced — dead/weak Kalman-derived
+# features (kalman_trend, kalman_innovation_norm, kalman_trend_uncertainty; verified IC~0.0)
+# swapped for alpha_data cross_asset_features.py's rolling beta/correlation/relative-strength
+# vs BANKNIFTY_FUT (cross_pair_beta/cross_pair_corr/cross_pair_relative_strength) — same
+# tensor width (F=30), but different semantics at those positions. Breaks state_dict
+# compatibility with v14 checkpoints only insofar as encoder weights were tuned to the old
+# column meanings (shape is unchanged, so old checkpoints will still *load* under a
+# non-strict version check, but their conv/linear weights at those input positions are
+# trained against different signal and should be treated as a fresh retrain, not resumed).
+# v14: feature-onboarding pass — FusionEncoder widened 4->5 slots
+# (genuine option_surface embedding via OptionSurfaceEncoder, no longer aliased onto the
+# futures slot), regime plane 22->24 (realized_vol_vix_ratio, breadth_index_divergence,
+# both direct alpha_data reads). Breaks state_dict compatibility with v13 checkpoints.
+# v13: Upstox-only provenance + persisted barrier horizon/cost contract.
 # v12: feature/label overhaul Phases 2-3 dimension changes —
 # candle plane 19->30 (trend/vol/session/cross-sectional/Kalman features), futures
 # plane 13->14 (oi_basis_interaction), regime plane 20->22 (usdinr_vol/crude_vol).

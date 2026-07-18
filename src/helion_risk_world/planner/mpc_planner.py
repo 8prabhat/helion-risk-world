@@ -19,6 +19,7 @@ from __future__ import annotations
 from helion_risk_world.config.execution_config import CostModelConfig
 from helion_risk_world.config.planner_config import PlannerConfig
 from helion_risk_world.config.risk_config import RiskShieldConfig
+from helion_risk_world.execution.cost_model import round_trip_cost_frac
 from helion_risk_world.execution.execution_reality import ExecutionReality
 from helion_risk_world.execution.order_builder import build_candidate_order
 from helion_risk_world.planner.action_auditor import ActionAuditor
@@ -99,14 +100,17 @@ class MPCPlanner:
     ) -> MPCPlanner:
         planner_cfg = planner_cfg or PlannerConfig()
         risk_cfg = risk_cfg or RiskShieldConfig()
+        resolved_cost_cfg = cost_cfg or CostModelConfig()
         return cls(
             sampler=ActionSampler(planner_cfg.sizes),
             portfolio_world=PortfolioWorld(
                 cost_rate=0.0,
                 n_samples=planner_cfg.n_outcome_samples,
                 cvar_alpha=planner_cfg.cvar_alpha,
+                stop_target_mode=planner_cfg.stop_target_mode,
+                cost_floor_frac=round_trip_cost_frac(resolved_cost_cfg),
             ),
-            execution_reality=ExecutionReality(cost_cfg or CostModelConfig()),
+            execution_reality=ExecutionReality(resolved_cost_cfg),
             scorer=RewardScorer(planner_cfg, risk_cfg),
             auditor=ActionAuditor(),
             risk_shield=RiskShield(risk_cfg),

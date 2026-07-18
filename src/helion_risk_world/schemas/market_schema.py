@@ -111,3 +111,10 @@ class EventContext(_PITModel):
     crude_ret_5d: float | None = None
     usdinr_vol: float | None = None
     crude_vol: float | None = None
+    # Realized-vol/VIX ratio (alpha_data pipelines/cross_asset_features.py::compute_vol_ratio) --
+    # the model's own strongest known walk-forward signal (see configs/v1.yaml's volatility loss
+    # weight comment). breadth_index_divergence (alpha_data pipelines/breadth_features.py) is the
+    # mean-constituent-return-vs-index-return spread -- a distribution signal a price-only index
+    # model can't see on its own.
+    realized_vol_vix_ratio: float | None = None
+    breadth_index_divergence: float | None = None

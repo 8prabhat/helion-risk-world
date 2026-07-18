@@ -43,19 +43,31 @@ def _build_dW_distribution(
     n_samples: int,
     event_uniforms: np.ndarray,
     return_uniforms: np.ndarray,
+    stop_target_mode: str = "barrier_context",
+    cost_floor_frac: float = 0.0,
 ) -> np.ndarray:
     """Build a ΔW outcome array from head-implied distribution (analytic, no path sim).
 
     Outcomes:
-      stop    → explicit stop return (or legacy fallback)
-      target  → explicit target return (or legacy fallback)
+      stop    → explicit stop return (or legacy fallback), or quantile-derived
+      target  → explicit target return (or legacy fallback), or quantile-derived
       timeout → sampled from return-quantile distribution at H=12
     All converted to fraction-of-capital ΔW.
+
+    ``stop_target_mode="quantile"`` (2026-07-16): sizes stop/target from the model's own
+    predicted return-quantile distribution (asymmetric, regime-adaptive) instead of the
+    fixed symmetric BarrierContext multiplier frozen at training time -- see
+    ModelPrediction.quantile_stop_return's docstring for the diagnosis this responds to.
+    Default ("barrier_context") preserves the original behavior exactly.
     """
     side = "short" if signed_notional < 0.0 else "long"
     p = prediction.barrier_for_side(side)
-    stop_ret = prediction.resolved_stop_return_for_side(side, fallback_mult=d)
-    tgt_ret = prediction.resolved_target_return_for_side(side, fallback_mult=u)
+    if stop_target_mode == "quantile":
+        stop_ret = prediction.quantile_stop_return_for_side(side, min_abs_return=cost_floor_frac)
+        tgt_ret = prediction.quantile_target_return_for_side(side, min_abs_return=cost_floor_frac)
+    else:
+        stop_ret = prediction.resolved_stop_return_for_side(side, fallback_mult=d)
+        tgt_ret = prediction.resolved_target_return_for_side(side, fallback_mult=u)
 
     p_stop = float(p.stop)
     p_tgt = float(p.target)
@@ -88,15 +100,21 @@ class PortfolioWorld:
         n_samples: int = 1000,
         cvar_alpha: float = 0.05,
         seed: int = 7,
+        stop_target_mode: str = "barrier_context",
+        cost_floor_frac: float = 0.0,
     ) -> None:
         if cost_rate < 0:
             raise ValueError("cost_rate must be non-negative")
+        if stop_target_mode not in ("barrier_context", "quantile"):
+            raise ValueError(f"unsupported stop_target_mode: {stop_target_mode!r}")
         self._cost_rate = cost_rate
         self._u = u
         self._d = d
         self._n_samples = n_samples
         self._cvar_alpha = cvar_alpha
         self._rng = np.random.default_rng(seed)
+        self._stop_target_mode = stop_target_mode
+        self._cost_floor_frac = cost_floor_frac
 
     def sample_noise(self) -> tuple[np.ndarray, np.ndarray]:
         """Generate common random numbers for one decision step."""
@@ -136,6 +154,8 @@ class PortfolioWorld:
             n_samples=self._n_samples,
             event_uniforms=event_uniforms,
             return_uniforms=return_uniforms,
+            stop_target_mode=self._stop_target_mode,
+            cost_floor_frac=self._cost_floor_frac,
         )
 
         exp_dW = float(dW_vec.mean()) / cap
@@ -174,15 +194,30 @@ class PortfolioWorld:
         cost: float,
         max_exposure: float,
         market: ExecutionState | None = None,
+        carry_return: float = 0.0,
     ) -> PortfolioState:
-        """Settle an executed action with the REALIZED return (backtest/paper fill)."""
+        """Settle an executed action with the REALIZED return (backtest/paper fill).
+
+        ``realized_return`` applies to the POST-fill notional (the position held after
+        this step's action executes). ``carry_return`` applies to the PRE-fill notional
+        — the position carried into this step, marked from the previous settlement point
+        to this step's fill price. This split matters for EXIT (the old position must
+        realize its final mark→fill move even though the new notional is zero) and for
+        side flips. Default ``carry_return=0.0`` preserves the original single-leg
+        semantics for callers that settle one-shot returns (paper engine, tests).
+        """
         resolved = resolve_executable_position(
             state,
             action,
             max_exposure,
             market=market,
         )
-        realized_pnl = resolved.new_signed_notional * realized_return - cost
+        old_signed_notional = resolved.new_signed_notional - resolved.delta_signed_notional
+        realized_pnl = (
+            old_signed_notional * carry_return
+            + resolved.new_signed_notional * realized_return
+            - cost
+        )
         return PortfolioWorld._next_state(
             state,
             action,

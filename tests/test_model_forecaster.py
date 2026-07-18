@@ -282,6 +282,8 @@ def test_trainer_overfits_small_slice() -> None:
             barrier=0.0,
             regime=0.0,
             direction=0.0,
+            repr_var=0.0,
+            repr_cov=0.0,
         )
     )
     cfg = TrainingConfig(seed=0, device="cpu", lr=1e-2, max_epochs=200, embargo_bars=12)

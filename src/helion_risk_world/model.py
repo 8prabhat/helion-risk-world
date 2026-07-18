@@ -16,18 +16,23 @@ import torch
 from torch import Tensor, nn
 
 from helion_risk_world.config.model_config import ModelConfig
+from helion_risk_world.data.option_surface_builder import SURFACE_CONTEXT_FEATURES, SURFACE_STRIKE_CHANNELS
 from helion_risk_world.data.regime_builder import REGIME_CONTEXT_FEATURES
 from helion_risk_world.encoders.cross_asset_encoder import CrossAssetEncoder
 from helion_risk_world.encoders.fusion_encoder import FusionEncoder
 from helion_risk_world.encoders.futures_encoder import FUTURES_FEATURE_DIM, FuturesEncoder
+from helion_risk_world.encoders.option_surface_encoder import OptionSurfaceEncoder, SurfaceTensors
 from helion_risk_world.encoders.regime_encoder import RegimeEncoder
 from helion_risk_world.encoders.temporal_encoder import TemporalEncoder
 from helion_risk_world.heads.barrier_head import BarrierHead
+from helion_risk_world.heads.direction_head import DirectionHead
 from helion_risk_world.heads.excursion_barrier_head import ExcursionBarrierHead
 from helion_risk_world.heads.excursion_head import ExcursionHead
+from helion_risk_world.heads.meta_label_head import MetaLabelHead, primary_side_from_candle_features
 from helion_risk_world.heads.ood_head import OODHead
 from helion_risk_world.heads.regime_head import RegimeHead
 from helion_risk_world.heads.return_head import ReturnQuantileHead
+from helion_risk_world.heads.touch_head import TouchHead
 from helion_risk_world.heads.uncertainty_head import UncertaintyHead
 from helion_risk_world.heads.volatility_head import VolatilityHead
 from helion_risk_world.worlds.market_world import MarketWorld
@@ -70,10 +75,11 @@ class HRWForecaster(nn.Module):
     """
 
     def __init__(self, n_features: int, cfg: ModelConfig | None = None,
-                 n_quantiles: int = 5) -> None:
+                 n_quantiles: int = 5, meta_label_lookback: int = 12) -> None:
         super().__init__()
         cfg = cfg or ModelConfig()
         d = cfg.latent_dim
+        self._meta_label_lookback = meta_label_lookback
         self.temporal = TemporalEncoder(n_features, latent_dim=d, layers=cfg.temporal_layers,
                                         dropout=cfg.dropout)
         self.cross_asset = CrossAssetEncoder(
@@ -85,6 +91,11 @@ class HRWForecaster(nn.Module):
             hidden_dim=d,
             layers=cfg.futures_conv_layers,
         )
+        self.option_surface_encoder = OptionSurfaceEncoder(
+            n_channels=len(SURFACE_STRIKE_CHANNELS),
+            n_context=len(SURFACE_CONTEXT_FEATURES),
+            latent_dim=d,
+        )
         self.regime_encoder = RegimeEncoder(len(REGIME_CONTEXT_FEATURES), latent_dim=d)
         self.fusion = FusionEncoder(latent_dim=d, method=cfg.fusion)
         self.return_head = ReturnQuantileHead(latent_dim=d, n_quantiles=n_quantiles)
@@ -93,9 +104,18 @@ class HRWForecaster(nn.Module):
         self.mfe_head = ExcursionHead(latent_dim=d)
         self.barrier_head = BarrierHead(latent_dim=d, context_dim=3)
         self.excursion_barrier_head = ExcursionBarrierHead()
+        # Decomposed barrier architecture (2026-07-13, see heads/direction_head.py's
+        # docstring for the full rationale): TouchHead answers "will either barrier be hit at
+        # all" (magnitude/volatility question, over the fused z); DirectionHead answers "if
+        # so, which way" (direction question) with a skip connection straight to the
+        # option-surface embedding, bypassing the shared fusion bottleneck that was measured
+        # losing that signal. Selected via barrier_mode="decomposed".
+        self.touch_head = TouchHead(latent_dim=d)
+        self.direction_head = DirectionHead(latent_dim=d, surface_dim=d)
         self.uncertainty_head = UncertaintyHead(latent_dim=d)
         self.regime_head = RegimeHead(latent_dim=d)
         self.ood_head = OODHead(latent_dim=d)
+        self.meta_label_head = MetaLabelHead(latent_dim=d)
         self.latent_dim = d
         self._barrier_mode = "legacy"
 
@@ -104,7 +124,7 @@ class HRWForecaster(nn.Module):
         return self._barrier_mode
 
     def set_barrier_mode(self, mode: str) -> None:
-        if mode not in {"legacy", "derived"}:
+        if mode not in {"legacy", "derived", "decomposed"}:
             raise ValueError(f"unsupported barrier mode: {mode!r}")
         self._barrier_mode = mode
 
@@ -113,17 +133,25 @@ class HRWForecaster(nn.Module):
         features: Tensor,
         futures: Tensor | None = None,
         regime: Tensor | None = None,
+        surface: SurfaceTensors | None = None,
     ) -> Tensor:
-        """Market features [B, A, L, F] (+ optional futures/regime) -> latent z_t [B, d]."""
+        """Market features [B, A, L, F] (+ optional futures/regime/option-surface) -> z_t [B, d]."""
         temporal = self.temporal(features)
         cross = self.cross_asset(features)
         futures_emb = self.futures_encoder(futures) if futures is not None else None
+        surface_emb = self.option_surface_encoder(surface) if surface is not None else None
         regime_emb = self.regime_encoder(regime) if regime is not None else None
-        return self.fusion(temporal, cross=cross, surface=futures_emb, regime=regime_emb)
+        return self.fusion(
+            temporal, cross=cross, futures=futures_emb, option_surface=surface_emb, regime=regime_emb
+        )
 
     @torch.no_grad()
     def fit_ood(
-        self, features: Tensor, futures: Tensor | None = None, regime: Tensor | None = None
+        self,
+        features: Tensor,
+        futures: Tensor | None = None,
+        regime: Tensor | None = None,
+        surface: SurfaceTensors | None = None,
     ) -> None:
         """Fit the OOD detector on the latents of ``features`` (call once after training)."""
         dev = next(self.parameters()).device
@@ -132,9 +160,11 @@ class HRWForecaster(nn.Module):
             futures = futures.to(dev)
         if regime is not None:
             regime = regime.to(dev)
+        if surface is not None:
+            surface = SurfaceTensors(*(t.to(dev) for t in surface))
         was_training = self.training
         self.eval()
-        self.ood_head.fit(self.encode(features, futures, regime))
+        self.ood_head.fit(self.encode(features, futures, regime, surface))
         if was_training:
             self.train()
 
@@ -144,17 +174,51 @@ class HRWForecaster(nn.Module):
         futures: Tensor | None = None,
         regime: Tensor | None = None,
         barrier_context: Tensor | None = None,
+        surface: SurfaceTensors | None = None,
+        primary_side: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        z = self.encode(features, futures, regime)
+        # Inlined (not a call to self.encode()) so `surface_emb` is available for
+        # DirectionHead's skip connection without changing encode()'s existing return
+        # contract (many callers -- fit_ood, WorldModelTrainer -- depend on it returning
+        # just z).
+        temporal = self.temporal(features)
+        cross = self.cross_asset(features)
+        futures_emb = self.futures_encoder(futures) if futures is not None else None
+        surface_emb = self.option_surface_encoder(surface) if surface is not None else None
+        regime_emb = self.regime_encoder(regime) if regime is not None else None
+        z = self.fusion(
+            temporal, cross=cross, futures=futures_emb, option_surface=surface_emb, regime=regime_emb
+        )
         volatility = self.volatility_head(z)
         mae = self.mae_head(z)
         mfe = self.mfe_head(z)
         barrier_features = _barrier_features(mae, mfe, volatility, barrier_context)
-        if _use_derived_barrier(self._barrier_mode, barrier_context):
+        touch_logit: Tensor | None = None
+        direction_logit: Tensor | None = None
+        if self._barrier_mode == "decomposed":
+            touch_logit = self.touch_head(z)
+            surface_for_direction = (
+                surface_emb
+                if surface_emb is not None
+                else torch.zeros(z.shape[0], self.latent_dim, device=z.device, dtype=z.dtype)
+            )
+            direction_logit = self.direction_head(z, surface_for_direction)
+            p_touch = torch.sigmoid(touch_logit)
+            p_up_given_touch = torch.sigmoid(direction_logit)
+            p_target = p_touch * p_up_given_touch
+            p_stop = p_touch * (1.0 - p_up_given_touch)
+            p_timeout = 1.0 - p_touch
+            probs = torch.stack([p_stop, p_target, p_timeout], dim=-1).clamp_min(1e-8)
+            barrier_logits = torch.log(probs)
+        elif _use_derived_barrier(self._barrier_mode, barrier_context):
             barrier_logits = self.excursion_barrier_head(barrier_features)
         else:
             barrier_logits = self.barrier_head(z, context=barrier_features)
-        return {
+        if primary_side is None:
+            primary_side = primary_side_from_candle_features(
+                features, lookback=self._meta_label_lookback
+            )
+        out = {
             "z": z,
             "return_quantiles": self.return_head(z),      # [B, Q]
             "volatility": volatility,                     # [B]
@@ -164,7 +228,13 @@ class HRWForecaster(nn.Module):
             "uncertainty": self.uncertainty_head(z),       # [B]
             "regime_logits": self.regime_head(z),          # [B, 6]
             "ood_score": self.ood_head(z),                 # [B, 1]
+            "primary_side": primary_side,                  # [B]
+            "meta_label_logit": self.meta_label_head(z, primary_side),  # [B]
         }
+        if touch_logit is not None:
+            out["touch_logit"] = touch_logit               # [B]
+            out["direction_logit"] = direction_logit        # [B]
+        return out
 
 
 class HRWWorldModel(nn.Module):
@@ -204,6 +274,11 @@ class HRWWorldModel(nn.Module):
             hidden_dim=d,
             layers=cfg.futures_conv_layers,
         )
+        self.option_surface_encoder = OptionSurfaceEncoder(
+            n_channels=len(SURFACE_STRIKE_CHANNELS),
+            n_context=len(SURFACE_CONTEXT_FEATURES),
+            latent_dim=d,
+        )
         self.regime_encoder = RegimeEncoder(len(REGIME_CONTEXT_FEATURES), latent_dim=d)
         self.fusion = FusionEncoder(latent_dim=d, method=cfg.fusion)
         # RSSM: embed_dim matches encoder output d; stoch_dim = d//4 for a compact latent
@@ -229,17 +304,25 @@ class HRWWorldModel(nn.Module):
         features: Tensor,
         futures: Tensor | None = None,
         regime: Tensor | None = None,
+        surface: SurfaceTensors | None = None,
     ) -> Tensor:
-        """Market features (+ optional futures/regime) -> latent market state z_t [B, d]."""
+        """Market features (+ optional futures/regime/option-surface) -> z_t [B, d]."""
         temporal = self.temporal(features)
         cross = self.cross_asset(features)
         futures_emb = self.futures_encoder(futures) if futures is not None else None
+        surface_emb = self.option_surface_encoder(surface) if surface is not None else None
         regime_emb = self.regime_encoder(regime) if regime is not None else None
-        return self.fusion(temporal, cross=cross, surface=futures_emb, regime=regime_emb)
+        return self.fusion(
+            temporal, cross=cross, futures=futures_emb, option_surface=surface_emb, regime=regime_emb
+        )
 
     @torch.no_grad()
     def fit_ood(
-        self, features: Tensor, futures: Tensor | None = None, regime: Tensor | None = None
+        self,
+        features: Tensor,
+        futures: Tensor | None = None,
+        regime: Tensor | None = None,
+        surface: SurfaceTensors | None = None,
     ) -> None:
         """Fit the runtime OOD normalizer on RSSM prior surprise scores."""
         was_training = self.training
@@ -250,7 +333,9 @@ class HRWWorldModel(nn.Module):
             futures = futures.to(dev)
         if regime is not None:
             regime = regime.to(dev)
-        z = self.encode(features, futures, regime)
+        if surface is not None:
+            surface = SurfaceTensors(*(t.to(dev) for t in surface))
+        z = self.encode(features, futures, regime, surface)
         window_e = z.unsqueeze(0)
         state = self.market_world.filter(window_e)
         raw = -self.market_world.rssm.prior(state.h).log_prob(state.z).sum(dim=-1)
@@ -282,6 +367,7 @@ class HRWWorldModel(nn.Module):
         barrier_context: Tensor | None = None,
         n_samples: int | None = None,
         state: RSSMState | None = None,
+        surface: SurfaceTensors | None = None,
         *,
         deterministic: bool = False,
     ) -> dict[str, object]:
@@ -296,7 +382,7 @@ class HRWWorldModel(nn.Module):
         deterministic (review finding M3): use RSSM means instead of samples, for
         reproducible eval/backtest runs. Off by default.
         """
-        z = self.encode(features, futures, regime)  # [B, d]
+        z = self.encode(features, futures, regime, surface)  # [B, d]
         # Treat the single encoded observation as a window of length 1 for the RSSM.
         # TemporalEncoder captures lookback history; RSSM imagines calibrated futures.
         window_e = z.unsqueeze(0)                    # [1, B, d]

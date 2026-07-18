@@ -39,20 +39,22 @@ def round_trip_cost_frac(
     fraction of notional; it defaults to roughly one BANKNIFTY_FUT lot (30 x ~50,000) at a
     representative price level. Brokerage is small relative to that notional, so this
     choice has minor sensitivity on the total.
+
+    STT and stamp duty are one-sided (STT on the sell leg, stamp duty on the buy leg --
+    see ``ConservativeIndianCostModel.statutory``'s docstring), so unlike the other
+    components they are added ONCE per round trip, not doubled with everything else.
     """
     brokerage_frac = cfg.brokerage_per_order / max(reference_notional, 1.0)
     gst_frac = cfg.gst_rate * (brokerage_frac + cfg.exchange_txn_rate)
-    one_way = (
+    both_sides_one_way = (
         brokerage_frac
-        + cfg.stt_rate
         + cfg.exchange_txn_rate
         + gst_frac
         + cfg.sebi_rate
-        + cfg.stamp_duty_rate
         + cfg.half_spread_bps
         + cfg.slippage_bps
     )
-    return float(2.0 * one_way)
+    return float(2.0 * both_sides_one_way + cfg.stt_rate + cfg.stamp_duty_rate)
 
 
 def overnight_financing_cost(
@@ -89,13 +91,22 @@ class ConservativeIndianCostModel:
         return float(half_frac * abs(order.notional))
 
     def statutory(self, order: CandidateOrder) -> float:
-        """Brokerage + STT + exchange txn + GST(on brokerage+exchange) + SEBI + stamp duty (INR)."""
+        """Brokerage + STT + exchange txn + GST(on brokerage+exchange) + SEBI + stamp duty (INR).
+
+        STT and stamp duty are ONE-SIDED in real Indian F&O statutory rules -- STT is
+        charged only on the SELL leg, stamp duty only on the BUY leg (cost-model audit,
+        2026-07-18: the previous version charged both on every order regardless of side,
+        roughly doubling their contribution to round-trip cost on top of the rate-value
+        bug fixed in ``CostModelConfig``). Exchange txn charge, SEBI fee, brokerage, and
+        GST genuinely apply to every order, both sides.
+        """
         cfg = self._cfg
         notional = abs(order.notional)
+        side = str(order.side).strip().lower()
         brokerage = cfg.brokerage_per_order
-        stt = cfg.stt_rate * notional
+        stt = cfg.stt_rate * notional if side == "sell" else 0.0
         exchange = cfg.exchange_txn_rate * notional
         gst = cfg.gst_rate * (brokerage + exchange)
         sebi = cfg.sebi_rate * notional
-        stamp = cfg.stamp_duty_rate * notional
+        stamp = cfg.stamp_duty_rate * notional if side == "buy" else 0.0
         return float(brokerage + stt + exchange + gst + sebi + stamp)

@@ -54,7 +54,13 @@ class RewardScorer:
 
         cap = max(state.capital, _EPS)
         exp_dW = consequence.exp_dW                           # E[ΔW] / capital
-        cvar_term = self._lam * consequence.cvar_dW           # λ · CVaR_α (positive shortfall)
+        # fill_prob scales BOTH the edge and the CVaR penalty (2026-07-18 fix): an
+        # unfilled order carries no position, hence no tail risk — scaling only the
+        # edge (as before) charged full CVaR against a discounted edge, a structural
+        # bias toward NO_TRADE that grew with fill uncertainty. Cost stays unscaled
+        # (conservative: spread/slippage are mostly incurred only on fill, so this
+        # slightly overstates cost rather than understating risk).
+        cvar_term = self._lam * consequence.cvar_dW * cost.fill_prob
         cost_total = cost.total_cost / cap
         filled_edge = exp_dW * cost.fill_prob
         raw_utility = filled_edge - cvar_term - cost_total

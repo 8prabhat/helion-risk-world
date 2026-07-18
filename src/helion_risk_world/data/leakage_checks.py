@@ -41,6 +41,10 @@ MARKET_FEATURE_NAMES: frozenset[str] = frozenset(
         "adx_14", "dmi_diff_14", "variance_ratio_20", "vol_ratio_short_long",
         "opening_range_position", "first_15min_return", "breadth", "dispersion",
         "kalman_trend", "kalman_innovation_norm", "kalman_trend_uncertainty",
+        # 2026-07-14: candle-plane columns 27-29 replaced kalman_* (see
+        # market_window_builder.py) -- old names kept above for historical-checkpoint
+        # compatibility with this registry, new names added alongside.
+        "cross_pair_beta", "cross_pair_corr", "cross_pair_relative_strength",
         # feature/label overhaul Phase 2 futures-plane addition (F=13 -> 14)
         "oi_basis_interaction",
         # regime context additions

@@ -1,0 +1,163 @@
+# HelionRiskWorld — 1-min / 2-hour-horizon variant (SPEC.md §29 base, adapted 2026-07-14).
+# Built to test the learning-curve finding that the model is data-starved, not
+# architecture-capped: 1-min bars give ~4.75x more labeled rows over the same calendar
+# window (179,574 vs 37,807 at 5min/H48) at the cost of a shorter absolute horizon
+# (2h vs the current best H48@5min=4h). See docs/model_training_diagnostics + this
+# session's learning-curve check for the full rationale. Reuses the legacy 3-way barrier
+# head (barrier_mode: derived) -- the only architecture that beat every decomposed
+# variant tried this session -- and the tuned repr_var/repr_cov anti-collapse defaults.
+#
+# Option-surface features are unavailable at 1-min (alpha_data only has single-ATM
+# ATM_CE/PE series at 1min, not the full multi-strike SURFACE_CE/PE backfill needed by
+# compute-surface-stats -- would require a live Upstox re-fetch across ~50 expiry
+# cycles). `_option_surface_data_available()` in scripts/train.py auto-detects this and
+# disables uses_option_surface with no config changes needed.
+
+project: helion_risk_world
+seed: 7
+
+data:
+  universe: [BANKNIFTY, NIFTY, FINNIFTY, HDFCBANK, ICICIBANK, SBIN, AXISBANK, KOTAKBANK]
+  base_interval: "1min"
+  # Reduced from 240 (2x horizon, 4h context) after that setting OOM-killed the first
+  # training attempt (64GB RAM machine, ~5x row count already in play from the 1-min
+  # switch) -- 120 bars = 1x horizon = 2h context, halving the sequence-length memory
+  # factor. Revisit upward only if this comfortably fits in memory.
+  lookback_bars: 120
+  n_strikes: 5
+  feature_cache_dir: feature_cache
+  data_sources_path: configs/data_sources.yaml
+  use_historical_depth: false # V1 guard — must remain false
+
+model:
+  size: small
+  latent_dim: 128
+  temporal_layers: 2
+  futures_conv_layers: 2
+  cross_asset_heads: 4
+  fusion: gated
+  rollout_samples: 16
+  dropout: 0.1
+  barrier_mode: derived
+  return_target_mode: timeout
+
+horizons:
+  base_interval: "1min"
+  # Bar count == minute count at 1-min, so these are directly 15/30/60/120-minute
+  # forward targets -- reuses the existing config's minute marks unchanged (15/30/60),
+  # drops the old 240-min mark (exceeds the new H=120), keeps 120 as the management
+  # horizon (2 hours).
+  horizon_steps: [15, 30, 60, 120]
+
+loss:
+  weights:
+    return: 1.0
+    direction: 0.5
+    volatility: 0.6
+    mae: 0.15
+    mfe: 0.15
+    barrier: 0.5
+    barrier_intermediate: 0.15
+    regime: 0.3
+    calibration: 0.4
+    uncertainty: 0.2
+    ood: 0.2
+    # repr_var/repr_cov left at their tuned defaults (0.1/0.005, see model_config.py) --
+    # not overridden here.
+
+planner:
+  sizes: [0.0, 0.1, 0.25, 0.5, 1.0]
+  min_edge_over_no_trade: 0.0
+  penalties:
+    slip: 1.0
+    dd: 1.5
+    cvar: 2.0
+    margin: 1.0
+    unc: 1.0
+    overtrade: 0.5
+    concentration: 0.5
+    exec: 2.0
+
+execution:
+  brokerage_per_order: 20.0
+  stt_rate: 0.000625
+  exchange_txn_rate: 0.00035
+  gst_rate: 0.18
+  sebi_rate: 0.000001
+  stamp_duty_rate: 0.00003
+  half_spread_bps: 0.0003
+  slippage_bps: 0.0002
+  default_spread_ticks: 1.0
+  tick_size: 0.2
+  base_fill_prob: 0.95
+  realism_high_cost_frac: 0.25
+  realism_low_cost_frac: 0.75
+  instrument_specs:
+    BANKNIFTY:
+      lot_size: 30
+      tick_size: 0.2
+      margin_fraction: 0.25
+    BANKNIFTY_FUT:
+      lot_size: 30
+      tick_size: 0.2
+      margin_fraction: 0.25
+
+risk_shield:
+  daily_loss_limit: 0.02
+  max_drawdown: 0.10
+  free_margin_floor: 0.20
+  uncertainty_block_threshold: 0.8
+  ood_block_threshold: 0.9
+  slippage_block_threshold: 0.5
+  max_exposure: 1.0
+  max_trades_per_day: 10
+  consecutive_loss_cooldown: 4
+  require_edge_over_cost: true
+  blackout_block: true
+
+training:
+  device: auto
+  batch_size: 256
+  grad_accum_steps: 1
+  # Disabled (was 15): Stage-2 self-supervised pretraining builds context/future pairs
+  # over the FULL raw 1-min OHLCV history (417,238 rows for BANKNIFTY alone, vs 83,579
+  # at 5-min), not just the ~179k usable labeled rows -- this is what crashed both
+  # earlier attempts (OOM-killed at lookback=240, then a resource-allocation crash at
+  # lookback=120; peak RSS ~44GB either way, well beyond what the ~179k labeled-row
+  # supervised path needs). Pretraining is an optional representation warm-start, not
+  # the object of this experiment (does more labeled 1-min data improve barrier
+  # classification) -- disabling it to isolate the supervised signal cleanly and get a
+  # first result; can revisit as a separate, memory-scoped follow-up.
+  pretrain_epochs: 0
+  # Matches the management horizon (120 bars = 2h at 1-min), same convention as
+  # v1_h48.yaml's pretrain_gap_bars=48.
+  pretrain_gap_bars: 120
+  max_epochs: 50
+  lr: 0.0003
+  weight_decay: 0.0001
+  early_stopping_patience: 16
+  checkpoint_dir: runs
+  train_fraction: 0.70
+  val_fraction: 0.15
+  n_folds: 5
+  embargo_bars: 120            # >= max horizon (this file: management horizon is 120 bars)
+
+risk_profile: banknifty_futures_conservative
+
+strategy:
+  name: medium_frequency
+
+promotion:
+  require_calibration_pass: true
+  require_paper_report: false
+  min_total_return: 0.0
+  min_annualized_return: 0.15
+  min_sharpe: 1.0
+  min_profit_factor: 1.1
+  max_drawdown: 0.15
+  min_hit_rate: 0.45
+  min_trades: 10
+  max_paper_drift_score: 0.3
+  max_paper_data_failure_rate: 0.1
+  max_paper_reject_rate: 0.2
+  fail_workflow_on_reject: false

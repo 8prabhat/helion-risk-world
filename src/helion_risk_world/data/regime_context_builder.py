@@ -162,6 +162,8 @@ class RegimeContextBuilder:
         crude_ret_5d   = daily.get("crude_ret_5d")
         usdinr_vol     = daily.get("usdinr_vol")
         crude_vol      = daily.get("crude_vol")
+        realized_vol_vix_ratio = daily.get("realized_vol_vix_ratio")
+        breadth_index_divergence = daily.get("breadth_index_divergence")
 
         # Live inference values override historical; fall back to None (-> 0 in featurizer)
         if self.require_live_iv and self.atm_iv is None and self.iv_skew is None:
@@ -212,6 +214,8 @@ class RegimeContextBuilder:
             crude_ret_5d=crude_ret_5d,
             usdinr_vol=usdinr_vol,
             crude_vol=crude_vol,
+            realized_vol_vix_ratio=realized_vol_vix_ratio,
+            breadth_index_divergence=breadth_index_divergence,
         )
         return regime, event
 

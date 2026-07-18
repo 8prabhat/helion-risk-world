@@ -14,42 +14,26 @@ Layout:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import numpy as np
+import pandas as pd
 
 from helion_risk_world.config.data_config import DataConfig
+from helion_risk_world.data.alpha_breadth_context import AlphaDataBreadthLoader
+from helion_risk_world.data.alpha_features import AlphaDataMarketWindowBuilder
+from helion_risk_world.data.alpha_futures_features import AlphaDataFuturesWindowBuilder
 from helion_risk_world.data.leakage_checks import assert_no_portfolio_in_market
-from helion_risk_world.data.market_window_builder import (
-    CANDLE_FEATURE_NAMES,
-    MarketWindowBuilder,
+from helion_risk_world.data.market_window_builder import CANDLE_FEATURE_NAMES
+from helion_risk_world.data.option_surface_builder import (
+    SURFACE_CONTEXT_FEATURES,
+    SURFACE_STRIKE_CHANNELS,
+    OptionSurfaceBuilder,
+    featurize_surface,
 )
-from helion_risk_world.data.futures_window_builder import FuturesWindowBuilder
-from helion_risk_world.data.option_surface_builder import OptionSurfaceBuilder
-
-# N-bar return window for breadth/dispersion (feature/label overhaul Phase 2) — matches
-# market_window_builder.py's _VOL_SHORT (12 bars = 1hr at 5-min) for consistency with
-# the other short-horizon features already anchored to that window.
-_BREADTH_WINDOW = 12
-
-
-def _trailing_n_bar_return(log_return: np.ndarray, n: int, axis: int) -> np.ndarray:
-    """Cumulative log return over a trailing n-bar window, via cumsum-diff along ``axis``.
-
-    For positions with fewer than n prior bars available, returns the cumulative return
-    since the start of the array (fewer than n bars) rather than NaN — a minor boundary
-    simplification consistent with this codebase's general warm-up handling elsewhere.
-    """
-    cumsum = np.cumsum(log_return, axis=axis)
-    shifted = np.zeros_like(cumsum)
-    slicer_dst = [slice(None)] * cumsum.ndim
-    slicer_src = [slice(None)] * cumsum.ndim
-    slicer_dst[axis] = slice(n, None)
-    slicer_src[axis] = slice(None, -n)
-    shifted[tuple(slicer_dst)] = cumsum[tuple(slicer_src)]
-    return cumsum - shifted
 
 # Re-export the shared primitives so callers can do `from ...feature_builder import realized_vol`
 # (SPEC.md §10 places the primitives at the feature-builder layer). Single definition lives in
@@ -69,10 +53,6 @@ from helion_risk_world.schemas.option_chain_schema import (
     OptionContractSnapshot,
     OptionSurfaceSnapshot,
 )
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    import pandas as pd
-
 
 # --------------------------------------------------------------------------------------
 # Point-in-time data access. ``FeatureBuilder`` depends on this Protocol, not a concrete
@@ -251,8 +231,8 @@ class FeatureBuilder:
     point-in-time access is delegated to a ``MarketDataSource`` (DIP).
 
     V1 futures path: pass ``futures_builder`` to attach the [L, 12] futures microstructure window
-    to each ``MarketBatch``. The FuturesWindowBuilder reads the assembled parquet produced by
-    ``scripts/assemble_data.py``.
+    to each ``MarketBatch``. ``AlphaDataFuturesWindowBuilder`` reads alpha_data's precomputed
+    futures-microstructure parquet directly (Phase 2 migration).
     """
 
     def __init__(
@@ -260,15 +240,19 @@ class FeatureBuilder:
         cfg: DataConfig,
         source: MarketDataSource,
         *,
-        window_builder: MarketWindowBuilder | None = None,
+        window_builder: AlphaDataMarketWindowBuilder | None = None,
         surface_builder: OptionSurfaceBuilder | None = None,
-        futures_builder: FuturesWindowBuilder | None = None,
+        futures_builder: AlphaDataFuturesWindowBuilder | None = None,
+        breadth_loader: AlphaDataBreadthLoader | None = None,
     ) -> None:
         self._cfg = cfg
         self._source = source
-        self._window = window_builder or MarketWindowBuilder()
+        self._window = window_builder or AlphaDataMarketWindowBuilder(interval=cfg.base_interval)
         self._surface = surface_builder or OptionSurfaceBuilder(n_strikes=cfg.n_strikes)
         self._futures = futures_builder   # None → futures not available; MarketBatch.futures = None
+        self._breadth = breadth_loader or AlphaDataBreadthLoader(
+            cfg.universe[0], interval=cfg.base_interval
+        )
 
     def build_window(self, ts: datetime) -> MarketBatch:
         """Build the point-in-time market batch at decision time ``ts``.
@@ -285,15 +269,22 @@ class FeatureBuilder:
         full_history_lookback = (
             len(timestamp_index()) if callable(timestamp_index) else self._cfg.lookback_bars
         )
-        for symbol in self._cfg.universe:
+        primary_index: pd.DatetimeIndex | None = None
+        for i, symbol in enumerate(self._cfg.universe):
             if callable(frame_window):
                 candles = frame_window(symbol, ts, full_history_lookback)
                 if len(candles) < 2:
                     raise ValueError(
                         f"insufficient candles for {symbol} at {ts}: got {len(candles)}, need >= 2"
                     )
-                full_window, names = self._window.build_frame(candles)  # type: ignore[arg-type]
+                build_frame_for_symbol = getattr(self._window, "build_frame_for_symbol", None)
+                if callable(build_frame_for_symbol):
+                    full_window, names = build_frame_for_symbol(symbol, candles)
+                else:
+                    full_window, names = self._window.build_frame(candles)  # type: ignore[arg-type]
                 window = full_window[-self._cfg.lookback_bars :]
+                if i == 0:
+                    primary_index = pd.DatetimeIndex(candles.index[-self._cfg.lookback_bars :])
             else:
                 candles = self._source.candle_window(symbol, ts, self._cfg.lookback_bars)
                 if len(candles) < 2:
@@ -306,7 +297,13 @@ class FeatureBuilder:
                         raise ValueError(
                             f"point-in-time violation for {symbol}: {c.available_at} > {ts}"
                         )
-                window, names = self._window.build(candles)  # [L, F]
+                build_for_symbol = getattr(self._window, "build_for_symbol", None)
+                if callable(build_for_symbol):
+                    window, names = build_for_symbol(symbol, candles, ts)
+                else:
+                    window, names = self._window.build(candles)  # [L, F]
+                if i == 0:
+                    primary_index = pd.DatetimeIndex([c.ts for c in candles])
             feats.append(window)
 
         lengths = {w.shape[0] for w in feats}
@@ -323,25 +320,15 @@ class FeatureBuilder:
             for a in range(candle_features.shape[0]):
                 candle_features[a, :, rel_idx] = candle_features[a, :, lr_idx] - primary_lr
 
-        # Fill breadth/dispersion (cols 25-26, feature/label overhaul Phase 2): market-wide
-        # scalars broadcast IDENTICALLY into every asset's row (unlike rel_log_return,
-        # which is per-asset-differentiated) — same broadcast shape tod_sin/dow_sin
-        # already use. Computed from the non-primary universe symbols' trailing N-bar
-        # returns; primary (BANKNIFTY) itself is excluded since it's effectively the
-        # index/median of these bank constituents already.
-        if "breadth" in names and "dispersion" in names and "log_return" in names:
-            lr_idx = names.index("log_return")
+        # Fill breadth/dispersion (cols 25-26) from alpha_data's real constituent breadth
+        # pipeline (feature-onboarding pass) instead of recomputing an equivalent statistic
+        # locally from the candle tensor's own trailing N-bar returns — market-wide scalars
+        # broadcast IDENTICALLY into every asset's row (unlike rel_log_return, which is
+        # per-asset-differentiated), same broadcast shape tod_sin/dow_sin already use.
+        if "breadth" in names and "dispersion" in names and primary_index is not None:
             breadth_idx = names.index("breadth")
             dispersion_idx = names.index("dispersion")
-            if candle_features.shape[0] > 1:
-                non_primary_n_bar_return = _trailing_n_bar_return(
-                    candle_features[1:, :, lr_idx], _BREADTH_WINDOW, axis=1
-                )  # [A-1, L]
-                breadth_vals = (non_primary_n_bar_return > 0.0).mean(axis=0)      # [L]
-                dispersion_vals = non_primary_n_bar_return.std(axis=0)            # [L]
-            else:
-                breadth_vals = np.full(candle_features.shape[1], 0.5, dtype=float)
-                dispersion_vals = np.zeros(candle_features.shape[1], dtype=float)
+            breadth_vals, dispersion_vals = self._breadth.aligned(primary_index)
             candle_features[:, :, breadth_idx] = breadth_vals[None, :]
             candle_features[:, :, dispersion_idx] = dispersion_vals[None, :]
 
@@ -379,11 +366,15 @@ class FeatureBuilder:
         index = primary.index
         feats: list[np.ndarray] = []
         names: tuple[str, ...] = CANDLE_FEATURE_NAMES
+        build_frame_for_symbol = getattr(self._window, "build_frame_for_symbol", None)
         for symbol in self._cfg.universe:
             frame = frames[symbol]
             if len(frame) != len(index) or not frame.index.equals(index):
                 raise ValueError("all aligned source frames must share the same timestamp index")
-            window, names = self._window.build_frame(frame)
+            if callable(build_frame_for_symbol):
+                window, names = build_frame_for_symbol(symbol, frame)
+            else:
+                window, names = self._window.build_frame(frame)
             feats.append(window.astype(np.float32, copy=False))
 
         candle_features = np.stack(feats, axis=1).astype(np.float32, copy=False)  # [T, A, F]
@@ -393,22 +384,13 @@ class FeatureBuilder:
             primary_lr = candle_features[:, 0, lr_idx]
             candle_features[:, :, rel_idx] = candle_features[:, :, lr_idx] - primary_lr[:, None]
 
-        # Fill breadth/dispersion (cols 25-26) — see build_window()'s identical-logic
-        # comment above; here the stack is [T, A, F] (axis=1 is the asset axis) instead
-        # of build_window()'s [A, L, F], so the trailing-return axis flips accordingly.
-        if "breadth" in names and "dispersion" in names and "log_return" in names:
-            lr_idx = names.index("log_return")
+        # Fill breadth/dispersion (cols 25-26) from alpha_data's real constituent breadth
+        # pipeline — see build_window()'s identical-logic comment above; here the stack is
+        # [T, A, F] (axis=1 is the asset axis) instead of build_window()'s [A, L, F].
+        if "breadth" in names and "dispersion" in names:
             breadth_idx = names.index("breadth")
             dispersion_idx = names.index("dispersion")
-            if candle_features.shape[1] > 1:
-                non_primary_n_bar_return = _trailing_n_bar_return(
-                    candle_features[:, 1:, lr_idx], _BREADTH_WINDOW, axis=0
-                )  # [T, A-1]
-                breadth_vals = (non_primary_n_bar_return > 0.0).mean(axis=1)      # [T]
-                dispersion_vals = non_primary_n_bar_return.std(axis=1)            # [T]
-            else:
-                breadth_vals = np.full(candle_features.shape[0], 0.5, dtype=float)
-                dispersion_vals = np.zeros(candle_features.shape[0], dtype=float)
+            breadth_vals, dispersion_vals = self._breadth.aligned(index)
             candle_features[:, :, breadth_idx] = breadth_vals[:, None]
             candle_features[:, :, dispersion_idx] = dispersion_vals[:, None]
 
@@ -420,6 +402,47 @@ class FeatureBuilder:
             candle_features=candle_features,
         )
 
+    def build_surface_history(
+        self, timestamps: Sequence[datetime]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Per-timestamp option-surface tensors for training (feature-onboarding pass).
+
+        Unlike ``build_history()`` (a contiguous per-bar candle history), option chains are
+        looked up one arbitrary (typically sparse, label-row) timestamp at a time via
+        ``self._source.option_chain(...)`` — there is no vectorized alpha_data chain-history
+        equivalent, so this loops per row exactly like ``scripts/train.py``'s existing
+        per-row ``regime_builder.build(ts)`` loop for ``regime_context_arr``.
+
+        Returns ``(grid[N,S,C], mask[N,S], context[N,K], eligible[N])``. A row is
+        ``eligible=False`` (grid/mask/context left zero) when no chain is available for
+        that underlying at that timestamp — the caller should exclude ineligible rows from
+        the trainable batch, matching ``AlphaDataFuturesWindowBuilder``'s per-row
+        eligibility convention.
+        """
+        primary = self._cfg.universe[0]
+        n = len(timestamps)
+        n_tokens = 2 * self._cfg.n_strikes + 1
+        grid = np.zeros((n, n_tokens, len(SURFACE_STRIKE_CHANNELS)), dtype=np.float32)
+        mask = np.zeros((n, n_tokens), dtype=np.float32)
+        context = np.zeros((n, len(SURFACE_CONTEXT_FEATURES)), dtype=np.float32)
+        eligible = np.zeros(n, dtype=bool)
+        for i, ts in enumerate(timestamps):
+            chain = self._source.option_chain(primary, ts)
+            if not chain:
+                continue
+            spot = self._source.spot(primary, ts)
+            snapshot = self._surface.align_to_atm(chain, spot, ts)
+            g, m, c = featurize_surface(snapshot)
+            if g.shape[0] != n_tokens:
+                continue  # defensive: unexpected token count for this cycle/day, skip row
+            grid[i], mask[i], context[i] = g, m, c
+            eligible[i] = True
+        return grid, mask, context, eligible
+
     @property
-    def futures_builder(self) -> FuturesWindowBuilder | None:
+    def futures_builder(self) -> AlphaDataFuturesWindowBuilder | None:
         return self._futures
+
+    @property
+    def surface_builder(self) -> OptionSurfaceBuilder:
+        return self._surface

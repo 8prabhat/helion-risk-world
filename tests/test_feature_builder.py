@@ -14,8 +14,8 @@ import pytest
 from helion_risk_world.config.data_config import DataConfig
 from helion_risk_world.data import primitives as P
 from helion_risk_world.data.feature_builder import FeatureBuilder, InMemoryMarketDataSource
-from helion_risk_world.data.leakage_checks import MARKET_FEATURE_NAMES, PORTFOLIO_FEATURE_NAMES
-from helion_risk_world.data.market_window_builder import CANDLE_FEATURE_NAMES, MarketWindowBuilder
+from helion_risk_world.data.leakage_checks import PORTFOLIO_FEATURE_NAMES
+from helion_risk_world.data.market_window_builder import CANDLE_FEATURE_NAMES
 from helion_risk_world.schemas.market_schema import MarketCandle
 from helion_risk_world.schemas.option_chain_schema import OptionContractSnapshot, OptionType
 
@@ -72,22 +72,6 @@ def _candles(symbol: str, n: int = 30, base: float = 100.0) -> list[MarketCandle
     return rows
 
 
-def test_window_builder_shape_and_names() -> None:
-    feats, names = MarketWindowBuilder().build(_candles("BANKNIFTY"))
-    assert names == CANDLE_FEATURE_NAMES
-    assert feats.shape == (30, len(CANDLE_FEATURE_NAMES))
-    assert np.isfinite(feats).all()  # warm-up NaNs filled with 0.0
-    assert set(names).issubset(MARKET_FEATURE_NAMES)  # all market-plane
-    assert set(names).isdisjoint(PORTFOLIO_FEATURE_NAMES)
-
-
-def test_window_builder_rejects_unsorted() -> None:
-    rows = _candles("X", 5)
-    rows[2], rows[3] = rows[3], rows[2]
-    with pytest.raises(ValueError):
-        MarketWindowBuilder().build(rows)
-
-
 # ---------------- FeatureBuilder.build_window ----------------
 def _cfg() -> DataConfig:
     return DataConfig(universe=("BANKNIFTY", "NIFTY"), lookback_bars=30, n_strikes=2)
@@ -135,11 +119,12 @@ def test_build_window_train_backtest_parity() -> None:
     b = builder.build_window(ts)
     assert np.array_equal(a.candle_features, b.candle_features)
     assert a.feature_names == b.feature_names
-
-    # And the builder column matches a direct primitive computation (single source of truth).
-    close = np.array([c.close for c in candles["BANKNIFTY"]])
-    col = a.feature_names.index("log_return")
-    assert np.allclose(a.candle_features[0, :, col], np.nan_to_num(P.log_returns(close)))
+    # NOTE: this no longer also checks the log_return column against a direct
+    # P.log_returns(close) computation from the synthetic candles -- since the Phase 2
+    # alpha_data migration, the window builder reads alpha_data's real precomputed
+    # features by timestamp rather than computing from whatever candles are passed
+    # in, so a synthetic-candle input's own close prices are no longer the source of
+    # the returned features (see data/alpha_features.py).
 
 
 def test_build_window_excludes_future_candles() -> None:
@@ -179,46 +164,17 @@ def _directional_candles(symbol: str, direction: float, n: int = 30) -> list[Mar
     return rows
 
 
-def test_breadth_dispersion_reflect_universe_direction() -> None:
-    """3 non-primary symbols: 2 trending up, 1 trending down -> breadth ~ 2/3, and
-    dispersion > 0 since they don't all move together."""
-    cfg = DataConfig(universe=("BANKNIFTY", "NIFTY", "FINNIFTY", "HDFCBANK"), lookback_bars=30)
-    candles = {
-        "BANKNIFTY": _directional_candles("BANKNIFTY", direction=1.0),  # primary, excluded
-        "NIFTY": _directional_candles("NIFTY", direction=1.0),
-        "FINNIFTY": _directional_candles("FINNIFTY", direction=1.0),
-        "HDFCBANK": _directional_candles("HDFCBANK", direction=-1.0),
-    }
-    ts = candles["BANKNIFTY"][-1].ts
-    source = InMemoryMarketDataSource(candles=candles)
-    batch = FeatureBuilder(cfg, source).build_window(ts)
-
-    breadth_idx = batch.feature_names.index("breadth")
-    dispersion_idx = batch.feature_names.index("dispersion")
-    last_breadth = batch.candle_features[:, -1, breadth_idx]
-    last_dispersion = batch.candle_features[:, -1, dispersion_idx]
-
-    # 2 of 3 non-primary symbols trending up -> breadth ~ 0.667.
-    assert last_breadth[0] == pytest.approx(2.0 / 3.0, abs=1e-6)
-    assert last_dispersion[0] > 0.0
-
-    # Market-wide scalar: identical across every asset's row at this timestamp.
-    assert np.allclose(last_breadth, last_breadth[0])
-    assert np.allclose(last_dispersion, last_dispersion[0])
-
-
-def test_breadth_uniform_when_all_non_primary_agree() -> None:
-    cfg = DataConfig(universe=("BANKNIFTY", "NIFTY", "FINNIFTY"), lookback_bars=30)
-    candles = {
-        "BANKNIFTY": _directional_candles("BANKNIFTY", direction=-1.0),
-        "NIFTY": _directional_candles("NIFTY", direction=1.0),
-        "FINNIFTY": _directional_candles("FINNIFTY", direction=1.0),
-    }
-    ts = candles["BANKNIFTY"][-1].ts
-    source = InMemoryMarketDataSource(candles=candles)
-    batch = FeatureBuilder(cfg, source).build_window(ts)
-    breadth_idx = batch.feature_names.index("breadth")
-    assert batch.candle_features[0, -1, breadth_idx] == pytest.approx(1.0, abs=1e-6)
+# NOTE: test_breadth_dispersion_reflect_universe_direction and
+# test_breadth_uniform_when_all_non_primary_agree were removed here (Phase 2 alpha_data
+# migration): both asserted an EXACT breadth/dispersion value computed from a
+# synthetic, hand-constructed directional close-price pattern -- but the window
+# builder now reads alpha_data's real precomputed log_return by timestamp rather than
+# computing it from whatever candles are passed in, so a synthetic pattern's exact
+# expected breadth (e.g. "2 of 3 trending up -> 0.667") can no longer be
+# deterministically reproduced. test_build_window_and_build_history_breadth_consistent
+# below still covers the part of this that remains meaningful post-migration: that
+# build_window and build_history agree with EACH OTHER on whatever real breadth value
+# they compute, regardless of source.
 
 
 def test_build_window_and_build_history_breadth_consistent() -> None:

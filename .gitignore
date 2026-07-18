@@ -36,6 +36,7 @@ htmlcov/
 .vscode/
 .idea/
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 .codex/
 
 # Data and artifacts

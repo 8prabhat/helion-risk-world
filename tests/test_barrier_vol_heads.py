@@ -14,9 +14,16 @@ torch = pytest.importorskip("torch")
 
 from helion_risk_world.config.model_config import LossWeights, ModelConfig  # noqa: E402
 from helion_risk_world.config.training_config import TrainingConfig  # noqa: E402
+from helion_risk_world.data.option_surface_builder import (  # noqa: E402
+    SURFACE_CONTEXT_FEATURES,
+    SURFACE_STRIKE_CHANNELS,
+)
+from helion_risk_world.encoders.option_surface_encoder import SurfaceTensors  # noqa: E402
 from helion_risk_world.heads.barrier_head import BARRIER_CLASSES, BarrierHead  # noqa: E402
+from helion_risk_world.heads.direction_head import DirectionHead  # noqa: E402
 from helion_risk_world.heads.excursion_barrier_head import ExcursionBarrierHead  # noqa: E402
 from helion_risk_world.heads.excursion_head import ExcursionHead  # noqa: E402
+from helion_risk_world.heads.touch_head import TouchHead  # noqa: E402
 from helion_risk_world.heads.uncertainty_head import UncertaintyHead  # noqa: E402
 from helion_risk_world.heads.volatility_head import VolatilityHead  # noqa: E402
 from helion_risk_world.inference import ForecasterPredictor  # noqa: E402
@@ -234,3 +241,113 @@ def test_barrier_weight_zero_keeps_derived_barrier_path_inert() -> None:
     HRWTrainer(model, ForecasterLoss(), cfg).fit([batch])
 
     assert torch.allclose(initial, model.excursion_barrier_head.linear.weight)
+
+
+# ---------------- decomposed barrier architecture (2026-07-13) ----------------
+def _surface_tensors(bsz: int, n_strikes: int = 5) -> SurfaceTensors:
+    s = 2 * n_strikes + 1
+    return SurfaceTensors(
+        grid=torch.randn(bsz, s, len(SURFACE_STRIKE_CHANNELS)),
+        mask=torch.ones(bsz, s),
+        context=torch.randn(bsz, len(SURFACE_CONTEXT_FEATURES)),
+    )
+
+
+def test_touch_head_shape() -> None:
+    assert TouchHead(latent_dim=16)(torch.randn(4, 16)).shape == (4,)
+
+
+def test_direction_head_shape_and_skip_connection_matters() -> None:
+    head = DirectionHead(latent_dim=16, surface_dim=16)
+    z = torch.randn(4, 16)
+    surface_a = torch.randn(4, 16)
+    surface_b = torch.randn(4, 16)
+    out_a = head(z, surface_a)
+    out_b = head(z, surface_b)
+    assert out_a.shape == (4,)
+    # Different surface embeddings (same z) must change the output -- otherwise the skip
+    # connection isn't actually wired into the computation graph.
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_forecaster_decomposed_mode_emits_touch_and_direction_logits() -> None:
+    model = _model()
+    model.set_barrier_mode("decomposed")
+    bsz = 3
+    surf = _surface_tensors(bsz)
+    out = model(torch.randn(bsz, A, L, FEAT), surface=surf)
+    assert out["touch_logit"].shape == (bsz,)
+    assert out["direction_logit"].shape == (bsz,)
+    assert out["barrier_logits"].shape == (bsz, 3)
+    # barrier_logits is log(probs) reconstructed from touch/direction -- softmax must recover
+    # a valid, normalized 3-way distribution consistent with the two binary heads.
+    probs = torch.softmax(out["barrier_logits"], dim=-1)
+    assert torch.allclose(probs.sum(dim=-1), torch.ones(bsz), atol=1e-5)
+    p_touch = torch.sigmoid(out["touch_logit"])
+    assert torch.allclose(probs[:, 2], 1.0 - p_touch, atol=1e-5)  # timeout = 1 - touch
+
+
+def test_forecaster_decomposed_mode_rejects_invalid_barrier_mode() -> None:
+    model = _model()
+    with pytest.raises(ValueError):
+        model.set_barrier_mode("not_a_real_mode")
+
+
+def test_training_decomposed_mode_trains_touch_and_direction_heads_not_old_heads() -> None:
+    """Gradients must reach the new heads (and their skip-connected option-surface encoder)
+    while the OLD 3-way barrier heads (unused in this mode) stay completely inert -- proving
+    the double-supervision guard in composite_loss.py actually works."""
+    torch.manual_seed(0)
+    bsz = 8
+    feats = torch.randn(bsz, A, L, FEAT)
+    ret = torch.rand(bsz) * 0.04
+    direction = torch.randint(0, 3, (bsz,))
+    barrier = torch.randint(0, 3, (bsz,))  # 0=stop, 1=target, 2=timeout
+    surf = _surface_tensors(bsz)
+    cfg = TrainingConfig(device="cpu", lr=1e-2, max_epochs=20, embargo_bars=12, weight_decay=0.0)
+
+    model = _model()
+    model.set_barrier_mode("decomposed")
+    w_touch = model.touch_head.mlp[0].weight.detach().clone()
+    w_direction = model.direction_head.mlp[0].weight.detach().clone()
+    w_surface = model.option_surface_encoder.phi[0].weight.detach().clone()
+    w_barrier_head = model.barrier_head.linear.weight.detach().clone()
+    w_excursion_barrier = model.excursion_barrier_head.linear.weight.detach().clone()
+
+    batch = ForecastBatch(
+        feats, ret, direction, barrier=barrier,
+        surface_grid=surf.grid, surface_mask=surf.mask, surface_context=surf.context,
+    )
+    HRWTrainer(model, ForecasterLoss(), cfg).fit([batch])
+
+    assert not torch.allclose(w_touch, model.touch_head.mlp[0].weight)
+    assert not torch.allclose(w_direction, model.direction_head.mlp[0].weight)
+    assert not torch.allclose(w_surface, model.option_surface_encoder.phi[0].weight)
+    # The old 3-way heads are unused in decomposed mode -- must receive zero gradient.
+    assert torch.allclose(w_barrier_head, model.barrier_head.linear.weight)
+    assert torch.allclose(w_excursion_barrier, model.excursion_barrier_head.linear.weight)
+
+
+def test_direction_loss_ignores_timeout_rows() -> None:
+    """All-timeout labels must train touch_head (learn to always predict "no touch") but
+    leave direction_head untouched (there's no direction to supervise when nothing touched)."""
+    torch.manual_seed(0)
+    bsz = 8
+    feats = torch.randn(bsz, A, L, FEAT)
+    ret = torch.rand(bsz) * 0.04
+    direction = torch.randint(0, 3, (bsz,))
+    barrier = torch.full((bsz,), 2, dtype=torch.long)  # all timeout
+    surf = _surface_tensors(bsz)
+    cfg = TrainingConfig(device="cpu", lr=1e-2, max_epochs=20, embargo_bars=12, weight_decay=0.0)
+
+    model = _model()
+    model.set_barrier_mode("decomposed")
+    w_direction = model.direction_head.mlp[0].weight.detach().clone()
+
+    batch = ForecastBatch(
+        feats, ret, direction, barrier=barrier,
+        surface_grid=surf.grid, surface_mask=surf.mask, surface_context=surf.context,
+    )
+    HRWTrainer(model, ForecasterLoss(), cfg).fit([batch])
+
+    assert torch.allclose(w_direction, model.direction_head.mlp[0].weight)

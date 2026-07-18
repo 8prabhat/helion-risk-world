@@ -149,3 +149,35 @@ def test_short_side_swaps_barrier_semantics_and_underlying_barrier_returns() -> 
     assert short_barrier.target == pytest.approx(0.2)
     assert pred.resolved_stop_return_for_side("short") == pytest.approx(0.03)
     assert pred.resolved_target_return_for_side("short") == pytest.approx(-0.01)
+
+
+def test_quantile_stop_target_mode_produces_different_consequence_than_barrier_context() -> None:
+    """2026-07-16: stop_target_mode="quantile" must actually change scoring behavior
+    (proves the wiring reaches PortfolioWorld, not just that it doesn't crash) --
+    skewed quantiles should shift exp_dW/cvar_dW relative to the fixed symmetric
+    BarrierContext-derived sizing used by the default mode."""
+    base = _prediction(0.0, 0.02, p_stop=0.4, p_target=0.4)
+    # Explicit symmetric BarrierContext (what "barrier_context" mode will use) alongside
+    # asymmetric quantiles (what "quantile" mode will use instead) on the SAME prediction.
+    skewed_quantiles = {0.1: -0.003, 0.25: -0.001, 0.5: 0.001, 0.75: 0.006, 0.9: 0.01}
+    pred = base.model_copy(
+        update={
+            "stop_return": -0.01, "target_return": 0.01,
+            "horizon_preds": [base.horizon_preds[0].model_copy(update={"return_quantiles": skewed_quantiles})],
+        }
+    )
+    action = CandidateAction(action_type=ActionType.ENTER_LONG, size_fraction=1.0)
+
+    pw_barrier = PortfolioWorld(n_samples=2000, seed=7)
+    pw_quantile = PortfolioWorld(n_samples=2000, seed=7, stop_target_mode="quantile")
+
+    _, cons_barrier = pw_barrier.step(_fresh(), action, pred, RISK)
+    _, cons_quantile = pw_quantile.step(_fresh(), action, pred, RISK)
+
+    assert cons_barrier.exp_dW != cons_quantile.exp_dW
+    assert cons_barrier.cvar_dW != cons_quantile.cvar_dW
+
+
+def test_quantile_mode_rejects_unsupported_value() -> None:
+    with pytest.raises(ValueError):
+        PortfolioWorld(stop_target_mode="bogus")

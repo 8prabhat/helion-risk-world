@@ -1,0 +1,193 @@
+# HelionRiskWorld — V1 base config (SPEC.md §29).
+# V1 uses candles + OI + futures + India VIX + expiry/event flags + (optional) option-chain
+# snapshots + SIMULATED portfolio states + a conservative cost model. NO historical tick/depth.
+
+project: helion_risk_world
+seed: 7
+
+data:
+  universe: [BANKNIFTY, NIFTY, FINNIFTY, HDFCBANK, ICICIBANK, SBIN, AXISBANK, KOTAKBANK]
+  base_interval: "5min"
+  lookback_bars: 96
+  n_strikes: 5                 # ATM-5 .. ATM+5  -> 11 strike tokens
+  feature_cache_dir: feature_cache
+  data_sources_path: configs/data_sources.yaml
+  use_historical_depth: false # V1 guard — must remain false
+
+model:
+  size: small                 # small | medium  (large = GPU cluster only)
+  latent_dim: 128
+  temporal_layers: 2
+  futures_conv_layers: 2
+  cross_asset_heads: 4
+  fusion: gated
+  rollout_samples: 16
+  dropout: 0.1
+  # Phase 5 correction: the Phase 4b diagnosis below (both barrier_mode retrains failing to
+  # learn the true class distribution) was traced to a real bug, not a barrier_mode choice --
+  # HRWWorldModel.forward() was silently dropping the "barrier_logits" key from its output
+  # dict, so WorldModelLoss's barrier cross-entropy terms were no-ops for every batch of both
+  # Phase 4b retrains. Neither barrier_head nor excursion_barrier_head ever received gradient;
+  # the "legacy vs derived" comparison that motivated this setting was comparing two untrained
+  # heads. With the bug fixed (barrier_logits restored + intermediate-horizon deep supervision,
+  # see loss.weights.barrier_intermediate below), that comparison is invalid and needs
+  # re-running. Defaulting to derived here as a fresh, low-confidence choice -- it's the
+  # simpler classifier (3 scalar excursion ratios, no separate weight matrix over the latent
+  # state) and the natural fit for weight-sharing across horizons -- but compare both modes
+  # on a short smoke run before committing to a full retrain, don't assume this is settled.
+  #
+  # Original (now-superseded) Phase 4b note, kept for context: at H=192, "derived" barrier
+  # logits (computed from the mae_head/mfe_head excursion forecasts divided by the
+  # sqrt(192)-scaled barrier width) produced a systematically wrong ~40/40/20
+  # stop/target/timeout split vs the true ~12/9/80 split -- realized labels' own mae/mfe-to-
+  # barrier ratios were confirmed correctly distributed, so the mismatch was attributed to
+  # the model's own excursion forecasts. That attribution is now known to be wrong: the real
+  # cause was zero gradient reaching either head, not an architectural mismatch.
+  # EXPERIMENTAL OVERRIDE (this file only): reverted back to derived (the project default)
+  # for the H=48 test -- the legacy-vs-derived comparison at H=192 already showed legacy
+  # doesn't actually fix the underlying collapse, it just flips which majority class the
+  # model defaults to (0% stop -> 0% timeout instead). That's a separate, orthogonal
+  # question from "does the horizon choice matter" -- keeping barrier_mode fixed at derived
+  # here isolates the horizon variable cleanly.
+  barrier_mode: derived
+  return_target_mode: timeout # timeout = conditional return on no-barrier paths; this matches the planner's stop/target/timeout mixture contract
+
+horizons:
+  base_interval: "5min"
+  # EXPERIMENTAL OVERRIDE (this file only): a fresh per-feature walk-forward IC diagnostic
+  # (scripts/feature_ic_diagnostic.py, run 2026-07-11) directly contradicts the old Phase 4a
+  # claim above -- it found the option-surface features (pcr, max_pain_rel, iv_skew; none of
+  # which existed in the model before the feature-onboarding pass) carry real, fold-stable
+  # directional signal (|IC| up to ~0.43 on the barrier-edge proxy) that PEAKS at H=48 bars,
+  # not H=192 -- e.g. surface__pcr: -0.16 (H3) -> -0.43 (H48) -> -0.30 (H192). Testing H=48 as
+  # the management horizon directly, using labels_h48.parquet (regenerated with --H 48).
+  horizon_steps: [3, 6, 12, 48]
+
+loss:
+  weights:
+    return: 1.0
+    direction: 0.5
+    # Bumped 0.3 -> 0.6 (2026-07-06): a causal, walk-forward OOS diagnostic against this exact
+    # dataset found near-zero/negative directional-return signal at every horizon (barrier/
+    # direction/quantile targets all reflect this -- barrier_macro_f1 tops out ~0.37), but
+    # STRONG, monotonically-improving-with-horizon volatility-ratio signal (OOS corr 0.34 at
+    # 12 bars -> 0.65 at 192 bars, positive in every single walk-forward fold, no exceptions).
+    # The volatility loss now also normalizes by barrier_sigma (see composite_loss.py /
+    # world_model_loss.py) so it targets this ratio, not the raw (regime-drifty) level.
+    volatility: 0.6
+    mae: 0.15
+    mfe: 0.15
+    barrier: 0.5
+    barrier_intermediate: 0.15  # Phase 5b deep-supervision aux at non-management horizons
+    regime: 0.3
+    calibration: 0.4
+    uncertainty: 0.2
+    ood: 0.2
+
+planner:
+  sizes: [0.0, 0.1, 0.25, 0.5, 1.0]
+  min_edge_over_no_trade: 0.0
+  penalties:
+    slip: 1.0
+    dd: 1.5
+    cvar: 2.0
+    margin: 1.0
+    unc: 1.0
+    overtrade: 0.5
+    concentration: 0.5
+    exec: 2.0
+
+execution:
+  brokerage_per_order: 20.0
+  stt_rate: 0.000625
+  exchange_txn_rate: 0.00035
+  gst_rate: 0.18
+  sebi_rate: 0.000001
+  stamp_duty_rate: 0.00003
+  half_spread_bps: 0.0003
+  slippage_bps: 0.0002
+  default_spread_ticks: 1.0
+  tick_size: 0.2
+  base_fill_prob: 0.95
+  realism_high_cost_frac: 0.25
+  realism_low_cost_frac: 0.75
+  instrument_specs:
+    BANKNIFTY:
+      lot_size: 30
+      tick_size: 0.2
+      margin_fraction: 0.25
+    BANKNIFTY_FUT:
+      lot_size: 30
+      tick_size: 0.2
+      margin_fraction: 0.25
+
+risk_shield:
+  daily_loss_limit: 0.02
+  max_drawdown: 0.10
+  free_margin_floor: 0.20
+  uncertainty_block_threshold: 0.8
+  ood_block_threshold: 0.9
+  slippage_block_threshold: 0.5
+  max_exposure: 1.0
+  max_trades_per_day: 10
+  consecutive_loss_cooldown: 4
+  require_edge_over_cost: true
+  blackout_block: true
+
+training:
+  device: auto                # mps on Mac Studio
+  batch_size: 256
+  grad_accum_steps: 1
+  # Tier 1 experiment (2026-07-04): Stage 2 self-supervised encoder pretraining
+  # (MarketStatePretrainer, VICReg-style future-latent prediction) was OFF throughout
+  # Phases 0-5 despite SPEC.md marking it "done" and despite it being structurally
+  # analogous to future-latent prediction used in self-supervised market encoders.
+  # Turning it on: it trains on the full raw OHLCV history via
+  # build_market_pretrain_pairs (~64k 5-min bars per symbol, 2023-01 to 2026-06), not just
+  # the 24,462 labeled rows, and the encoder is never frozen afterward for the world_model
+  # path (confirmed in scripts/train.py::_train_model_once) so it can't lock in a
+  # representation that fails to carry barrier/quantile signal (SPEC.md's own flagged
+  # alignment risk, §14.4) -- it keeps adapting through Stage 3/4.
+  pretrain_epochs: 15         # Stage 2 optional encoder pretraining; set > 0 to enable
+  # Gap (in bars) between context/future windows for Stage 2 future-latent prediction.
+  # Matches the management horizon (horizons.horizon_steps below) so the task predicts a
+  # genuinely future latent rather than a near-identical, barely-shifted window (review
+  # finding H6 — the old default of 1 made this task nearly trivial at lookback_bars=96).
+  pretrain_gap_bars: 48       # matches this file's management horizon (48 bars)
+  max_epochs: 50
+  lr: 0.0003
+  weight_decay: 0.0001
+  # EXPERIMENTAL OVERRIDE (this file only, not v1.yaml): bumped back to 16 to test
+  # whether the feature-onboarding pass's wider architecture (5 fusion inputs, K=24
+  # regime) + a larger/more-volatile labels.parquet (includes the 2024-06 election
+  # result window) just needs more gradient steps to get the UncertaintyHead's
+  # cold-start sigma (fixed at 0.005 at init) and the barrier classifier out of their
+  # majority-class collapse -- v1.yaml's own history (2026-07-05) warned this exact
+  # bump regressed barrier_brier before, but that was pre-Phase-5 barrier_logits fix
+  # and pre-dates this feature-onboarding pass; re-testing deliberately, not blindly.
+  early_stopping_patience: 16
+  checkpoint_dir: runs
+  train_fraction: 0.70
+  val_fraction: 0.15
+  n_folds: 5
+  embargo_bars: 48            # >= max horizon (this file: management horizon is now 48 bars)
+
+risk_profile: banknifty_futures_conservative  # default account sized to make the BankNIFTY futures target tradeable
+
+strategy:
+  name: medium_frequency
+
+promotion:
+  require_calibration_pass: true
+  require_paper_report: false
+  min_total_return: 0.0
+  min_annualized_return: 0.15
+  min_sharpe: 1.0
+  min_profit_factor: 1.1
+  max_drawdown: 0.15
+  min_hit_rate: 0.45
+  min_trades: 10
+  max_paper_drift_score: 0.3
+  max_paper_data_failure_rate: 0.1
+  max_paper_reject_rate: 0.2
+  fail_workflow_on_reject: false

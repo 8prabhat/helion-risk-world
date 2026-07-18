@@ -56,6 +56,31 @@ def test_unfitted_ood_scores_zero() -> None:
     assert float(OODHead(latent_dim=8).score(torch.randn(3, 8)).mean()) == 0.0
 
 
+def test_ood_score_not_dominated_by_near_collapsed_dimension() -> None:
+    """2026-07-15 regression: a real trained artifact had 14/128 latent dims with
+    std < 0.02 (residual dimensional collapse), which drove ood_score > 0.9 on 97% of a
+    real backtest's decisions -- one near-zero-variance dimension dominated the
+    diagonal-Mahalanobis average even though the other dimensions looked normal. Build
+    the same pathology at small scale: 7 normal dims (std~1) + 1 near-collapsed dim
+    (std~0.01), then check an in-distribution point that only deviates ordinarily on the
+    near-collapsed dim doesn't get flagged as extremely OOD."""
+    torch.manual_seed(0)
+    train = torch.randn(2000, 8)
+    train[:, 7] *= 0.01  # one near-collapsed dimension
+    det = OODHead(latent_dim=8)
+    det.fit(train)
+    # Ordinary point: near the mean on 7 dims, and a SMALL (not extreme) absolute
+    # deviation on the collapsed dim -- 0.03 is ~3x that dimension's raw std (0.01),
+    # not an outlier in real terms, but would be a z-score of ~3 pre-floor.
+    ordinary = torch.zeros(1, 8)
+    ordinary[0, 7] = 0.03
+    assert float(det.score(ordinary).item()) < 0.5
+    # A genuinely far-out point (large deviation on every dimension) must still score
+    # high -- the floor shouldn't blind the detector to real outliers.
+    far = torch.full((1, 8), 5.0)
+    assert float(det.score(far).item()) > 0.9
+
+
 def test_bridge_emits_real_regime_probs_and_ood() -> None:
     torch.manual_seed(0)
     model = HRWForecaster(n_features=FEAT, cfg=ModelConfig(latent_dim=16, temporal_layers=1,

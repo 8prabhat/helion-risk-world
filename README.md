@@ -10,6 +10,45 @@ This repository is for research, simulation, backtesting, and dry-run paper trad
 
 ---
 
+## Current Status (2026-07-18)
+
+A full-codebase profitability sweep (features, labels, architecture, training,
+evaluation, backtesting) found and fixed four real defects, then added a new
+meta-labeling pipeline and re-validated on 3 retrained seeds:
+
+1. **Backtest settlement multi-count** — the engine settled the full H-bar forward
+   label against the position notional on *every held bar*, multi-counting P&L on any
+   multi-bar hold. Fixed with per-bar settlement legs
+   (`carry_return`/`fill_to_mark_return`) plus regression tests.
+2. **Uncorrected class-prior shift in barrier probabilities** — class-weighted training
+   provably inflates minority-class probabilities; the only fitted correction
+   (temperature scaling) cannot express a per-class prior shift. Fixed with
+   holdout-validated per-class log-prior offsets in `PredictionCalibration`.
+3. **Cost model overstated real friction by ~2.4x** (31.7bps → corrected **12.98bps**
+   round-trip) — a mislabeled options STT rate applied to futures, an 18x-too-high
+   exchange charge, and one-sided taxes (STT/stamp duty) double-charged on both legs.
+4. **Meta-labeling pipeline** (new): replaced the 3-class barrier-probabilities-then-CVaR
+   pipeline with a direct, cost-aware binary question — "would a trade in the
+   momentum-based primary side's direction clear round-trip cost" — via a new
+   `MetaLabelHead`, wired into training, calibration, and a `PositionSizer` confidence
+   gate. Paired with a utility-based checkpoint-selection option
+   (`--checkpoint-metric trading_utility`).
+
+**Result after all four fixes + retraining 3 seeds**: the strategy's default risk
+setting now genuinely takes trades (5 per seed on the held-out test window — before
+this session it took zero), a real behavioral change. But **none of 12 (seed × λ)
+backtest combinations was profitable**; the closest to breakeven was profit_factor
+0.897 (essentially a wash). Seed-to-seed variance remains larger than any single fix's
+effect (total_return ranged −0.17% to −0.89% across seeds at identical settings). This
+is a stronger, more trustworthy negative result than the prior "ceiling reached"
+verdict (which rested on the broken settlement engine and uncorrected probabilities),
+not a weaker one. **Two open, unexplored levers remain: a genuine multi-seed ensemble
+predictor (not built this session) and the label redesign** (still the
+highest-leverage structural direction). Full ledger of everything tried (what worked,
+what failed, what's open — check before retrying an old idea): `docs/investigation_log.md`.
+
+---
+
 ## Architecture Overview
 
 ```
@@ -90,17 +129,25 @@ RAW DATA (market-plane only — no portfolio or account fields)
 | 24 | `first_15min_return` | Cumulative return over the first 15 min, frozen after |
 | 25 | `breadth` | Fraction of universe (excl. primary) with positive 12-bar return |
 | 26 | `dispersion` | Cross-sectional std of universe 12-bar returns |
-| 27 | `kalman_trend` | Kalman-filtered log-price trend/slope (local-linear-trend model) |
-| 28 | `kalman_innovation_norm` | Kalman innovation, normalized by predicted variance |
-| 29 | `kalman_trend_uncertainty` | Posterior std of the Kalman trend state |
+| 27 | `cross_pair_beta` | Rolling OLS beta vs. a reference instrument (2026-07-15) |
+| 28 | `cross_pair_corr` | Rolling correlation vs. the same reference |
+| 29 | `cross_pair_relative_strength` | Relative return strength vs. the reference |
 
 `breadth`/`dispersion` are market-wide scalars broadcast identically into every asset's
 row; `rel_log_return` is per-asset-differentiated. Both are filled in by
 `FeatureBuilder` after stacking all universe symbols (see `feature_builder.py`).
-`kalman_trend`/`kalman_innovation_norm`/`kalman_trend_uncertainty` come from
-`data/kalman_trend.py::local_linear_trend_filter` — the only stateful/recursive
-feature in this file, with an explicit reset at genuine data gaps (see that module's
-docstring).
+`cross_pair_beta`/`cross_pair_corr`/`cross_pair_relative_strength` replaced the earlier
+`kalman_trend`/`kalman_innovation_norm`/`kalman_trend_uncertainty` triple on 2026-07-15
+(IC diagnostic found the Kalman columns near-dead: `kalman_trend_uncertainty` IC=0.0,
+`kalman_innovation_norm`≈0.000, `kalman_trend` weak and redundant with `ema_dist`).
+Sourced from `data/alpha_cross_pair_context.py` against alpha_data's per-pair
+`{symbol}_vs_{reference}_5min.parquet` files (each bank constituent vs. BANKNIFTY_FUT,
+BANKNIFTY_FUT vs. NIFTY; NIFTY/FINNIFTY zero-filled, no natural reference). This closes
+a real structural gap in `CrossAssetEncoder`, which mean-pools the time axis *before*
+cross-asset attention and so cannot learn rolling beta/covariance on its own — see
+`docs/investigation_log.md` §2 (macro_f1 +31% relative from this
+change alone, the largest single win recorded across every session). `ARTIFACT_VERSION` bumped
+14→15 for this swap (same F=30 width, semantics-only).
 
 ### Futures Microstructure Features (F=14, `futures_window_builder.py`)
 
@@ -496,3 +543,11 @@ python scripts/predict.py \
   before trusting calibrated thresholds under the new behavior.
 - **RSSM path**: `HRWWorldModel` and `WorldModelTrainer` are test-covered but not yet wired
   into a CLI training script.
+- **Option surface context (`SURFACE_CONTEXT_FEATURES`, 12-wide as of 2026-07-16)** is not shown
+  in the architecture diagram above, which predates it. It includes ATM call/put delta
+  (`atm_call_delta`/`atm_put_delta`, ranked #1/#2 of 124 features by IC — see
+  `docs/investigation_log.md` §2 item 9), sourced via
+  `data/alpha_option_chain.py::AlphaDataAtmGreeksLoader` with a local per-snapshot fallback.
+  `ARTIFACT_VERSION` bumped 15→16 for this change (a genuine 10→12 shape change, unlike the
+  same-width 14→15 cross-pair swap) — artifacts trained before this bump cannot be loaded
+  (`state_dict` shape mismatch on `option_surface_encoder.context.0.weight`).

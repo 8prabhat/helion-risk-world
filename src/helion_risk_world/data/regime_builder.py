@@ -1,6 +1,7 @@
 """Regime/event context featurisation (SPEC.md §14, §16; torch-free, DRY).
 
-K = 15 numeric + len(EventType) one-hot = 22 total.
+K = 17 numeric + len(EventType) one-hot = 24 total (feature-onboarding pass added
+realized_vol_vix_ratio + breadth_index_divergence, both direct alpha_data reads).
 
 Scaling conventions:
   vix           / 20      → O(0.5-1.5)
@@ -36,6 +37,18 @@ Scaling conventions:
                            latter can be transiently NaN during the derived series'
                            own rolling-window warmup even when the raw value exists,
                            which is a normalization artifact, not a data-missing fact.
+  realized_vol_vix_ratio    O(0.5-2.0)  realized vol (annualized %) / raw VIX level, from
+                           alpha_data's compute_vol_ratio (feature-onboarding pass) — the
+                           model's own walk-forward diagnostic (configs/v1.yaml) found this
+                           axis is its strongest available signal, monotonically improving
+                           with horizon. No fixed divisor: both numerator/denominator are
+                           already comparable annualized-vol-like quantities, so the raw
+                           ratio is already O(1).
+  breadth_index_divergence O(-0.01, 0.01) mean constituent log-return minus the index's own
+                           log-return, from alpha_data's breadth_features pipeline — a
+                           distribution/divergence signal distinct from the candle-plane's
+                           own breadth/dispersion columns (which are cross-sectional
+                           agreement/disagreement, not a directional divergence).
 """
 
 from __future__ import annotations
@@ -48,13 +61,14 @@ _NUMERIC: tuple[str, ...] = (
     "vix", "vix_pct", "atm_iv", "iv_skew", "expiry_flag", "event_day_flag",
     "blackout_active", "fii_dii_net_z", "usdinr_ret_5d", "crude_ret_5d",
     "pc_oi_ratio_z", "basis_daily", "usdinr_vol", "crude_vol", "regime_missing_mask",
+    "realized_vol_vix_ratio", "breadth_index_divergence",
 )
 EVENT_TYPE_ONEHOT: tuple[str, ...] = tuple(f"event_{t.value}" for t in EventType)
 REGIME_CONTEXT_FEATURES: tuple[str, ...] = _NUMERIC + EVENT_TYPE_ONEHOT
 
 
 def featurize_regime(regime: RegimeContext, event: EventContext) -> np.ndarray:
-    """``RegimeContext`` + ``EventContext`` -> [K=22] float32."""
+    """``RegimeContext`` + ``EventContext`` -> [K=24] float32."""
     missing_mask = 1.0 if (
         regime.atm_iv is None
         and regime.iv_skew is None
@@ -77,6 +91,8 @@ def featurize_regime(regime: RegimeContext, event: EventContext) -> np.ndarray:
         event.usdinr_vol or 0.0,                  # rolling std of usdinr_ret_5d
         event.crude_vol or 0.0,                    # rolling std of crude_ret_5d
         missing_mask,
+        event.realized_vol_vix_ratio or 0.0,      # alpha_data compute_vol_ratio
+        event.breadth_index_divergence or 0.0,    # alpha_data breadth_features
     ]
     onehot = [1.0 if event.event_type is t else 0.0 for t in EventType]
     return np.array(numeric + onehot, dtype=np.float32)

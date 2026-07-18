@@ -19,6 +19,12 @@ class PlannerConfig:
     cvar_alpha: float = 0.05
     sizes: tuple[float, ...] = (0.0, 0.1, 0.25, 0.5, 1.0)
     n_outcome_samples: int = 1000
+    # 2026-07-16: "quantile" sizes stop/target from the model's own predicted
+    # return-quantile distribution (asymmetric, regime-adaptive) instead of the fixed
+    # symmetric BarrierContext multiplier frozen at training time -- see
+    # ModelPrediction.quantile_stop_return's docstring for the diagnosis this responds
+    # to. Default preserves the original behavior exactly.
+    stop_target_mode: str = "barrier_context"
 
     def __post_init__(self) -> None:
         if not self.sizes or self.sizes[0] != 0.0:
@@ -27,3 +33,5 @@ class PlannerConfig:
             raise ValueError("risk_aversion_lambda must be >= 0")
         if not 0.0 < self.cvar_alpha < 1.0:
             raise ValueError("cvar_alpha must be in (0, 1)")
+        if self.stop_target_mode not in ("barrier_context", "quantile"):
+            raise ValueError(f"unsupported stop_target_mode: {self.stop_target_mode!r}")

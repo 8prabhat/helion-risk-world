@@ -127,6 +127,22 @@ class ModelPrediction(BaseModel):
             "ensemble), not a real RSSM rollout-spread estimate. See class docstring."
         ),
     )
+    primary_side: int = Field(
+        default=0, ge=-1, le=1,
+        description=(
+            "Meta-labeling's momentum-based primary signal (2026-07-18, see "
+            "labeling/meta_labels.py): +1 long, -1 short, 0 = no bet proposed. "
+            "Computed causally from the same candle features the encoder consumes."
+        ),
+    )
+    meta_label_prob: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description=(
+            "P(a trade in primary_side's direction nets more than round-trip cost), "
+            "from MetaLabelHead. None when primary_side == 0 (no side proposed, so "
+            "the question is undefined) or when the artifact predates this head."
+        ),
+    )
 
     @property
     def longest_horizon(self) -> HorizonPrediction:
@@ -199,6 +215,51 @@ class ModelPrediction(BaseModel):
         """Return the favourable underlying move for one trade side."""
         long_stop = self.resolved_stop_return(fallback_mult=fallback_mult)
         long_target = self.resolved_target_return(fallback_mult=fallback_mult)
+        if self._normalize_side(side) == "long":
+            return long_target
+        return -abs(long_stop)
+
+    def quantile_stop_return(self, *, min_abs_return: float = 0.0) -> float:
+        """Stop-loss return derived from the model's own predicted return-quantile
+        distribution at the longest horizon (2026-07-16), instead of a fixed symmetric
+        multiple of sigma_H -- asymmetric and regime-adaptive since return_quantiles is
+        recomputed every decision, unlike the frozen BarrierContext multiplier
+        (stop_mult/target_mult) baked in at training time (see resolved_stop_return's
+        docstring history / worlds/portfolio_world.py for the diagnosis this responds
+        to). Falls back to resolved_stop_return() if the low quantile level is missing.
+        ``min_abs_return`` is a floor on the magnitude (e.g. round-trip transaction cost)
+        supplied by the caller -- kept as a plain float here rather than importing
+        CostModelConfig/round_trip_cost_frac directly, so this schema module stays
+        free of execution-layer dependencies (PortfolioWorld already has cost config
+        in scope and can compute the right floor itself).
+        """
+        q = self.longest_horizon.return_quantiles.get(min(QUANTILE_LEVELS))
+        if q is None:
+            return self.resolved_stop_return()
+        return min(float(q), -abs(min_abs_return))
+
+    def quantile_target_return(self, *, min_abs_return: float = 0.0) -> float:
+        """Target return derived from the model's own predicted return-quantile
+        distribution at the longest horizon. See quantile_stop_return's docstring."""
+        q = self.longest_horizon.return_quantiles.get(max(QUANTILE_LEVELS))
+        if q is None:
+            return self.resolved_target_return()
+        return max(float(q), abs(min_abs_return))
+
+    def quantile_stop_return_for_side(self, side: str, *, min_abs_return: float = 0.0) -> float:
+        """Adverse underlying move for one trade side, quantile-derived (see
+        quantile_stop_return)."""
+        long_stop = self.quantile_stop_return(min_abs_return=min_abs_return)
+        long_target = self.quantile_target_return(min_abs_return=min_abs_return)
+        if self._normalize_side(side) == "long":
+            return long_stop
+        return abs(long_target)
+
+    def quantile_target_return_for_side(self, side: str, *, min_abs_return: float = 0.0) -> float:
+        """Favourable underlying move for one trade side, quantile-derived (see
+        quantile_stop_return)."""
+        long_stop = self.quantile_stop_return(min_abs_return=min_abs_return)
+        long_target = self.quantile_target_return(min_abs_return=min_abs_return)
         if self._normalize_side(side) == "long":
             return long_target
         return -abs(long_stop)

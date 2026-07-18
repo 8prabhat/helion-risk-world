@@ -85,8 +85,18 @@ _BUILTIN_PROFILES: dict[StrategyName, StrategyProfile] = {
     ),
     StrategyName.MEDIUM_FREQUENCY: StrategyProfile(
         name=StrategyName.MEDIUM_FREQUENCY,
-        decision_horizon_bars=192,
-        max_hold_bars=192,
+        # Updated 192->48 (2026-07-15): this session's feature/label-overhaul work
+        # deliberately moved the project's production management horizon from H192 to
+        # H48 (IC diagnostic found option-surface signal peaking at H48, and multiple
+        # training-methodology bugs made the H192 baseline unreliable -- H48 has been
+        # the config/labels default for the remainder of the session,
+        # configs/v1_h48.yaml). This profile was still hardcoded to the pre-migration
+        # H192 assumption, which made every H48 model artifact (the only kind trained
+        # since) incompatible with the medium_frequency strategy entirely (backtest.py
+        # requires the strategy's decision_horizon_bars to be in the artifact's
+        # available horizons -- an H48 artifact only has [48] available).
+        decision_horizon_bars=48,
+        max_hold_bars=48,
         confidence_scale=1.0,
         planner_config=PlannerConfig(
             risk_aversion_lambda=3.0,
@@ -105,7 +115,7 @@ _BUILTIN_PROFILES: dict[StrategyName, StrategyProfile] = {
             cvar_alpha=0.05,
             n_paths=256,
         ),
-        description="Barrier-managed BankNIFTY futures profile aligned to the H192 artifact.",
+        description="Barrier-managed BankNIFTY futures profile aligned to the H48 artifact.",
     ),
     StrategyName.LOW_FREQUENCY: StrategyProfile(
         name=StrategyName.LOW_FREQUENCY,

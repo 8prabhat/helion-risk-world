@@ -163,6 +163,7 @@ def predict_snapshot(
         futures=futures,
         regime=snapshot.regime,
         barrier_context=snapshot.barrier_context,
+        surface=snapshot.market.surface,
     )
     if runtime.prediction_calibration is not None:
         return runtime.prediction_calibration.apply(prediction)

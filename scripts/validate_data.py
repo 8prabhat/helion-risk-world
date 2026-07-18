@@ -13,8 +13,8 @@ from train import _demo_candles
 from _common import log, setup
 from helion_risk_world.config.loaders import data_config_from_mapping as data_config_from_cfg
 
+from helion_risk_world.data.alpha_futures_features import AlphaDataFuturesWindowBuilder
 from helion_risk_world.data.data_quality import DataQualityReport
-from helion_risk_world.data.futures_window_builder import FuturesWindowBuilder
 from helion_risk_world.data.parquet_source import ParquetMarketDataSource
 from helion_risk_world.data.provenance import validate_upstox_only_sources
 
@@ -162,34 +162,30 @@ def run_validation(
 
 
 def _validate_processed_futures(data_root: Path, lookback_bars: int) -> dict[str, object]:
-    path = data_root / "processed" / "banknifty_5min.parquet"
-    if not path.exists():
+    """Validate alpha_data's real futures-microstructure data (Phase 2 migration) via
+    ``AlphaDataFuturesWindowBuilder`` instead of the now-redundant local
+    ``banknifty_5min.parquet`` assembly. OHLC-validity/roll-gap tagging is alpha_data's
+    own ingestion QA responsibility now (see ``alpha_futures_features.py``'s docstring:
+    "stale-price/roll-gap handling already happens upstream in alpha_data's own ingestion
+    QA") -- this only checks index integrity and lookback-window availability, which is
+    what ``AlphaDataFuturesWindowBuilder`` can actually tell us. ``data_root`` is unused
+    here (kept for signature compatibility with ``_validate_labels``/
+    ``_validate_model_samples``, which still read the local ``labels.parquet``).
+    """
+    del data_root
+    try:
+        builder = AlphaDataFuturesWindowBuilder()
+    except FileNotFoundError:
         return {"present": False, "passed": True}
-    builder = FuturesWindowBuilder.from_parquet(str(path))
-    df = pd.read_parquet(path)
-    df.index = pd.to_datetime(df.index)
-    invalid = builder._invalid_ohlc_mask(df)  # strict schema check; sample gate decides repair/reject.
-    roll_gap = (
-        df["roll_gap"].fillna(False).astype(bool).to_numpy()
-        if "roll_gap" in df.columns
-        else np.zeros(len(df), dtype=bool)
-    )
-    untagged_invalid = invalid & ~roll_gap
-    eligible = builder.eligible_positions(lookback_bars) if len(df) else np.zeros(0, dtype=bool)
+    index, _ = builder.build_history()
+    eligible = builder.eligible_positions(lookback_bars) if len(index) else np.zeros(0, dtype=bool)
     return {
         "present": True,
         "passed": bool(
-            not df.index.has_duplicates
-            and int(untagged_invalid.sum()) == 0
-            and (len(df) < lookback_bars or int(eligible.sum()) > 0)
+            not index.has_duplicates and (len(index) < lookback_bars or int(eligible.sum()) > 0)
         ),
-        "path": str(path),
-        "rows": int(len(df)),
-        "duplicate_timestamps": int(df.index.duplicated().sum()),
-        "invalid_ohlc_rows": int(invalid.sum()),
-        "invalid_ohlc_roll_gap_rows": int((invalid & roll_gap).sum()),
-        "untagged_invalid_ohlc_rows": int(untagged_invalid.sum()),
-        "roll_gap_rows": int(roll_gap.sum()),
+        "rows": int(len(index)),
+        "duplicate_timestamps": int(pd.Index(index).duplicated().sum()),
         "eligible_positions": int(eligible.sum()),
         "ineligible_positions": int(len(eligible) - int(eligible.sum())),
     }
@@ -228,15 +224,17 @@ def _validate_model_samples(
     lookback_bars: int,
     labels_present: bool,
 ) -> dict[str, object]:
-    fut_path = data_root / "processed" / "banknifty_5min.parquet"
     labels_path = data_root / "processed" / "labels.parquet"
-    if not labels_present or not fut_path.exists() or not labels_path.exists():
+    if not labels_present or not labels_path.exists():
         return {"present": False, "passed": True}
     labels = pd.read_parquet(labels_path)
     if "ts" in labels.columns:
         labels = labels.set_index("ts")
     labels.index = pd.to_datetime(labels.index)
-    builder = FuturesWindowBuilder.from_parquet(str(fut_path))
+    try:
+        builder = AlphaDataFuturesWindowBuilder()
+    except FileNotFoundError:
+        return {"present": False, "passed": True}
     futures_index, _ = builder.build_history()
     positions = futures_index.get_indexer(pd.DatetimeIndex(labels.index))
     exists = positions >= 0

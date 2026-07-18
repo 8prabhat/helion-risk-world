@@ -153,6 +153,77 @@ def _add_persist_state_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_stop_target_mode_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--stop-target-mode",
+        choices=("barrier_context", "quantile"),
+        default="barrier_context",
+        help=(
+            "How the planner sizes stop/target levels for a candidate trade. "
+            "'barrier_context' (default) uses the fixed symmetric BarrierContext "
+            "multiplier frozen at training time. 'quantile' (2026-07-16) sizes from "
+            "the model's own predicted return-quantile distribution instead -- "
+            "asymmetric and regime-adaptive, since it's recomputed every decision. "
+            "See ModelPrediction.quantile_stop_return's docstring for the diagnosis "
+            "this responds to."
+        ),
+    )
+
+
+def _add_risk_aversion_lambda_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--risk-aversion-lambda",
+        type=float,
+        default=None,
+        help=(
+            "Override the strategy profile's PlannerConfig.risk_aversion_lambda "
+            "(mean-CVaR objective U = E[dW] - lambda*CVaR - cost). Default: use "
+            "whatever the chosen strategy profile already specifies (e.g. "
+            "medium_frequency=3.0). Diagnostic for sweeping risk-aversion to see "
+            "whether a CVaR-dominated zero-trade result is a calibration choice or a "
+            "hard floor the model's edge can't clear at any reasonable lambda."
+        ),
+    )
+
+
+def _add_eval_split_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--eval-split",
+        choices=("train", "val", "test"),
+        default="test",
+        help=(
+            "Which of the artifact's own persisted chronological splits to backtest "
+            "against (default: test, the normal held-out window). 'val' is a genuinely "
+            "different ~4-month window never used for weight updates (only for "
+            "early-stopping/model-selection/post-hoc calibration fitting) -- useful for "
+            "checking whether a result is specific to the test window's regime, without "
+            "a retrain. 'train' was used to fit weights directly and is NOT a fair "
+            "out-of-sample check; only use it to sanity-check general behavior, not to "
+            "draw conclusions about generalization."
+        ),
+    )
+
+
+def _add_checkpoint_metric_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--checkpoint-metric",
+        choices=("loss", "trading_utility"),
+        default="loss",
+        help=(
+            "How HRWTrainer selects the best checkpoint / drives early stopping. "
+            "'loss' (default) uses the composite validation loss, unchanged from "
+            "before. 'trading_utility' (2026-07-18) instead scores the meta-label "
+            "head's own trade/no-trade decision rule against held-out outcomes -- "
+            "see training/checkpoint_metrics.py::trading_utility_loss. Requires "
+            "labels.parquet to have primary_side/meta_label columns (schema "
+            "version >= 9, see labeling/meta_labels.py); otherwise the metric is "
+            "always 0.0 (neutral) and checkpoint selection degenerates to 'pick "
+            "the first epoch that doesn't regress', so don't use this without "
+            "meta-labeled data."
+        ),
+    )
+
+
 def _add_calibration_gate_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--calibration-report",
@@ -188,6 +259,10 @@ _OPTION_BUILDERS: dict[str, OptionBuilder] = {
     "walk_forward": _add_walk_forward_option,
     "calibration_gate": _add_calibration_gate_options,
     "persist_state": _add_persist_state_option,
+    "stop_target_mode": _add_stop_target_mode_option,
+    "risk_aversion_lambda": _add_risk_aversion_lambda_option,
+    "eval_split": _add_eval_split_option,
+    "checkpoint_metric": _add_checkpoint_metric_option,
 }
 
 

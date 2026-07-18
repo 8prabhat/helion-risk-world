@@ -158,3 +158,60 @@ def test_training_with_futures_trains_the_futures_encoder() -> None:
     batch = ForecastBatch(feats, ret, direction, futures=_futures(bsz))
     HRWTrainer(m_fut, ForecasterLoss(), cfg).fit([batch])
     assert not torch.allclose(w_fut, m_fut.futures_encoder.conv[0].weight)
+
+
+# ---------------- V1 option-surface-encoder training integration (feature-onboarding pass) --------
+def _surfaces(b: int = 1, n_strikes: int = 3):
+    """Synthetic batched (grid, mask, context) tensors, [B, S, C]/[B, S]/[B, K]."""
+    grids, masks, contexts = [], [], []
+    for _ in range(b):
+        g, m, c = featurize_surface(_surface(n_strikes=n_strikes))
+        grids.append(g)
+        masks.append(m)
+        contexts.append(c)
+    return (
+        torch.tensor(np.stack(grids)),
+        torch.tensor(np.stack(masks)),
+        torch.tensor(np.stack(contexts)),
+    )
+
+
+def test_forecaster_uses_option_surface_when_provided() -> None:
+    """OptionSurfaceEncoder changes the latent state vs. OHLCV-only mode."""
+    torch.manual_seed(0)
+    model = HRWForecaster(n_features=FEAT, cfg=ModelConfig(latent_dim=16, temporal_layers=1,
+                                                          dropout=0.0)).eval()
+    feats = torch.randn(1, A, L, FEAT)
+    grid, mask, context = _surfaces(1)
+    surface = SurfaceTensors(grid=grid, mask=mask, context=context)
+    with torch.no_grad():
+        z_no = model(feats)["z"]
+        z_surf = model(feats, surface=surface)["z"]
+    assert z_no.shape == z_surf.shape
+    assert not torch.allclose(z_no, z_surf)
+
+
+def test_training_with_surface_trains_the_option_surface_encoder() -> None:
+    """Surface tensors in the batch put OptionSurfaceEncoder in the gradient graph."""
+    torch.manual_seed(0)
+    bsz = 8
+    feats = torch.randn(bsz, A, L, FEAT)
+    ret = torch.rand(bsz) * 0.04
+    direction = torch.randint(0, 3, (bsz,))
+    cfg = TrainingConfig(device="cpu", lr=1e-2, max_epochs=20, embargo_bars=12)
+
+    # No surface -> option_surface_encoder receives no gradient; phi weight stays fixed.
+    m_no = _train_model()
+    w_no = m_no.option_surface_encoder.phi[0].weight.detach().clone()
+    HRWTrainer(m_no, ForecasterLoss(), cfg).fit([ForecastBatch(feats, ret, direction)])
+    assert torch.allclose(w_no, m_no.option_surface_encoder.phi[0].weight)
+
+    # With surface -> the encoder is trained (weights change).
+    m_surf = _train_model()
+    w_surf = m_surf.option_surface_encoder.phi[0].weight.detach().clone()
+    grid, mask, context = _surfaces(bsz)
+    batch = ForecastBatch(
+        feats, ret, direction, surface_grid=grid, surface_mask=mask, surface_context=context,
+    )
+    HRWTrainer(m_surf, ForecasterLoss(), cfg).fit([batch])
+    assert not torch.allclose(w_surf, m_surf.option_surface_encoder.phi[0].weight)

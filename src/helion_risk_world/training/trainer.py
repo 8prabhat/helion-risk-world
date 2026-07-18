@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 from helion_risk_world.config.training_config import TrainingConfig
+from helion_risk_world.encoders.option_surface_encoder import SurfaceTensors
 from helion_risk_world.integration.quanthelion_adapter import ModelProtocol, get_logger
 from helion_risk_world.training.nan_guard import skip_if_non_finite
 
@@ -53,6 +54,15 @@ class ForecastBatch:
     horizon_mae: Tensor | None = None      # [B, H] max adverse excursion per horizon
     horizon_mfe: Tensor | None = None      # [B, H] max favorable excursion per horizon
     barrier_context: Tensor | None = None  # [B, 3] sigma + explicit stop/target returns
+    surface_grid: Tensor | None = None     # [B, S, C] option-surface strike grid; optional
+    surface_mask: Tensor | None = None     # [B, S] option-surface strike mask; optional
+    surface_context: Tensor | None = None  # [B, K] option-surface snapshot context; optional
+    primary_side: Tensor | None = None     # [B] float in {-1,0,1}; meta-labeling primary signal
+                                            # from the label file (labeling/meta_labels.py) --
+                                            # passed explicitly to forward() so supervision uses
+                                            # the SAME primary_side the meta_label column was
+                                            # computed against, not a freshly-recomputed one.
+    meta_label: Tensor | None = None       # [B] float in {0,1}, NaN where primary_side==0
     target_horizons: tuple[int, ...] = ()  # metadata only; validated by world-model losses
 
     def to(self, device: torch.device) -> ForecastBatch:
@@ -79,6 +89,11 @@ class ForecastBatch:
             horizon_mae=_mv(self.horizon_mae),
             horizon_mfe=_mv(self.horizon_mfe),
             barrier_context=_mv(self.barrier_context),
+            surface_grid=_mv(self.surface_grid),
+            surface_mask=_mv(self.surface_mask),
+            surface_context=_mv(self.surface_context),
+            primary_side=_mv(self.primary_side),
+            meta_label=_mv(self.meta_label),
             target_horizons=self.target_horizons,
         )
 
@@ -100,12 +115,31 @@ class HRWTrainer:
     Depends on ModelProtocol + a loss callable, never concrete classes (SPEC.md §26).
     """
 
-    def __init__(self, model: ModelProtocol, loss: LossFn, cfg: TrainingConfig) -> None:
+    def __init__(
+        self,
+        model: ModelProtocol,
+        loss: LossFn,
+        cfg: TrainingConfig,
+        *,
+        checkpoint_metric: Callable[[ModelProtocol, Sequence["ForecastBatch"], torch.device], float]
+        | None = None,
+    ) -> None:
+        """``checkpoint_metric`` (2026-07-18, optional): when given, checkpoint
+        selection and early stopping use THIS value on ``val_batches`` instead of the
+        composite training loss -- e.g. ``training.checkpoint_metrics.trading_utility_loss``,
+        which scores "would this checkpoint's own meta-label decision rule have made
+        money on held-out data" rather than a generic weighted-loss composite. Must
+        return a LOWER-IS-BETTER scalar (like a loss) to be a drop-in replacement for
+        the default composite val_loss selection signal. ``None`` (default) preserves
+        the original behavior exactly: select on composite val_loss.
+        """
         self._model = model
         self._loss = loss
         self._cfg = cfg
+        self._checkpoint_metric = checkpoint_metric
         self.history: list[float] = []
         self.val_history: list[float] = []
+        self.val_metric_history: list[float] = []
         self.best_epoch: int | None = None
         self.n_skipped_batches: int = 0
 
@@ -135,6 +169,7 @@ class HRWTrainer:
 
         self.history = []
         self.val_history = []
+        self.val_metric_history = []
         self.best_epoch = None
         self.n_skipped_batches = 0
         best_state: dict[str, Tensor] | None = None
@@ -172,8 +207,17 @@ class HRWTrainer:
             if val_batches:
                 val_loss = self._evaluate(model, val_batches, device)
                 self.val_history.append(val_loss)
-                if val_loss < best_val - 1e-8:
-                    best_val = val_loss
+                # Composite val_loss is always computed (cheap, and useful for
+                # diagnostics/logging even when a custom checkpoint_metric drives
+                # selection). Selection/early-stopping use the custom metric INSTEAD
+                # of val_loss when one is configured (2026-07-18) -- see __init__'s
+                # docstring.
+                selection_value = val_loss
+                if self._checkpoint_metric is not None:
+                    selection_value = self._checkpoint_metric(model, val_batches, device)
+                    self.val_metric_history.append(selection_value)
+                if selection_value < best_val - 1e-8:
+                    best_val = selection_value
                     best_state = {
                         key: value.detach().cpu().clone()
                         for key, value in model.state_dict().items()
@@ -186,6 +230,8 @@ class HRWTrainer:
                 payload = {"epoch": epoch + 1, "loss": round(mean_loss, 6)}
                 if val_batches and self.val_history:
                     payload["val_loss"] = round(self.val_history[-1], 6)
+                if self.val_metric_history:
+                    payload["val_checkpoint_metric"] = round(self.val_metric_history[-1], 6)
                 _log.info("hrw.train.epoch", **payload)
                 print(
                     "TRAIN epoch={epoch} loss={loss}{val_loss}".format(
@@ -265,17 +311,29 @@ def _epoch_batch_indices(n_batches: int, *, seed: int, epoch: int) -> list[int]:
     return torch.randperm(n_batches, generator=generator).tolist()
 
 
+def _surface_tensors(batch: ForecastBatch) -> SurfaceTensors | None:
+    if batch.surface_grid is None or batch.surface_mask is None or batch.surface_context is None:
+        return None
+    return SurfaceTensors(grid=batch.surface_grid, mask=batch.surface_mask, context=batch.surface_context)
+
+
 def _model_forward(model: ModelProtocol, batch: ForecastBatch) -> dict[str, Tensor]:
     forward = model.forward  # type: ignore[attr-defined]
     params = inspect.signature(forward).parameters
+    kwargs: dict[str, object] = {}
     if "barrier_context" in params:
-        return forward(  # type: ignore[misc]
-            batch.features,
-            batch.futures,
-            batch.regime_context,
-            batch.barrier_context,
-        )
-    return forward(batch.features, batch.futures, batch.regime_context)  # type: ignore[misc]
+        kwargs["barrier_context"] = batch.barrier_context
+    if "primary_side" in params and batch.primary_side is not None:
+        kwargs["primary_side"] = batch.primary_side
+    surface = _surface_tensors(batch)
+    if surface is not None and "surface" in params:
+        kwargs["surface"] = surface
+    return forward(  # type: ignore[misc]
+        batch.features,
+        batch.futures,
+        batch.regime_context,
+        **kwargs,
+    )
 
 
 __all__ = ["HRWTrainer", "ForecastBatch", "resolve_device", "LossFn"]

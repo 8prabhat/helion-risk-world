@@ -349,3 +349,115 @@ def test_backtest_script_style_leakage_check_catches_bad_label_realized_at() -> 
     bad_labels = [(s.prediction.ts, s.label_realized_at) for s in bad_steps]
     with pytest.raises(LeakageError):
         LeakageReport().run(["close"], feature_rows=feature_rows, labels=bad_labels)
+
+
+# ---------------------------------------------------------------------------
+# Per-bar settlement (multi-count bug fix, 2026-07-18)
+# ---------------------------------------------------------------------------
+
+def _pred_nospec(ts: datetime, mean: float = 0.0, sigma: float = 0.01) -> ModelPrediction:
+    """Prediction for a symbol with NO instrument spec (continuous-notional fallback)."""
+    q = {
+        0.1: mean - 2 * sigma, 0.25: mean - sigma, 0.5: mean,
+        0.75: mean + sigma, 0.9: mean + 2 * sigma,
+    }
+    hp = HorizonPrediction(horizon_bars=12, return_quantiles=q, volatility=sigma)
+    return ModelPrediction(
+        symbol="TESTSYM", ts=ts,
+        horizon_preds=[hp],
+        barrier=BarrierProbabilities(stop=0.3, target=0.4, timeout=0.3),
+        mae=2 * sigma, sigma_H=sigma,
+        epistemic=0.0, aleatoric=sigma, ood_score=0.0,
+    )
+
+
+def _market_nospec(ts: datetime) -> ExecutionState:
+    return ExecutionState(symbol="TESTSYM", ts=ts, available_at=ts,
+                          bid=99.95, ask=100.05, spread=0.1)
+
+
+def test_held_position_settles_per_bar_marks_not_overlapping_h_bar_labels() -> None:
+    """Regression for the settlement multi-count bug: the real-data step builders put
+    the FULL H-bar forward label in realized_return and the engine settled
+    notional x that label EVERY held bar — a K-bar hold accrued K overlapping H-bar
+    returns. With carry_return/fill_to_mark_return populated, settlement must follow
+    the per-bar price path and the (poisoned, absurd) H-bar label must never reach P&L."""
+    ts = [TS0 + timedelta(minutes=5 * i) for i in range(4)]
+    planner = _FixedPlanner(
+        [
+            CandidateAction(action_type=ActionType.ENTER_LONG, size_fraction=1.0),
+            CandidateAction(action_type=ActionType.NO_TRADE, size_fraction=0.0),
+            CandidateAction(action_type=ActionType.NO_TRADE, size_fraction=0.0),
+            CandidateAction(action_type=ActionType.EXIT, size_fraction=0.0),
+        ]
+    )
+    # Price path: entry fill 100.0 -> marks 101 / 102 / 103 -> exit fill 103.5 (~+3.5%).
+    # realized_return is poisoned with an absurd +50% H-bar label on every step: under
+    # the pre-fix settlement a 3-bar hold would realize ~150% of notional.
+    poisoned_label = 0.5
+    steps = [
+        BacktestStep(
+            prediction=_pred_nospec(ts[0]), market=_market_nospec(ts[0]),
+            realized_return=poisoned_label,
+            carry_return=0.0,                                  # flat before entry
+            fill_to_mark_return=101.0 / 100.0 - 1.0,           # fill 100 -> mark 101
+        ),
+        BacktestStep(
+            prediction=_pred_nospec(ts[1]), market=_market_nospec(ts[1]),
+            realized_return=poisoned_label,
+            carry_return=101.5 / 101.0 - 1.0,                  # mark 101 -> open 101.5
+            fill_to_mark_return=102.0 / 101.5 - 1.0,           # open 101.5 -> mark 102
+        ),
+        BacktestStep(
+            prediction=_pred_nospec(ts[2]), market=_market_nospec(ts[2]),
+            realized_return=poisoned_label,
+            carry_return=102.5 / 102.0 - 1.0,
+            fill_to_mark_return=103.0 / 102.5 - 1.0,
+        ),
+        BacktestStep(
+            prediction=_pred_nospec(ts[3]), market=_market_nospec(ts[3]),
+            realized_return=poisoned_label,
+            carry_return=103.5 / 103.0 - 1.0,                  # final mark -> exit fill
+            fill_to_mark_return=0.0,                            # post-exit notional is 0
+        ),
+    ]
+    cap = 500_000.0
+    report = BacktestEngine(planner, TransactionCosts(CostModelConfig())).run(
+        steps, _account(cap), RISK
+    )
+    assert report.n_trades == 1
+    # True path P&L at full-capital notional is ~3.5% of capital (minus costs, plus
+    # minor per-bar compounding). The poisoned label would produce ~150%.
+    assert 0.020 * cap < report.net_pnl < 0.050 * cap
+    # trade_pnls accumulate net_step over the trade's life, so the single trade's
+    # P&L must equal the whole run's net P&L (cost-inclusive).
+    assert report.trade_pnls[0] == pytest.approx(report.net_pnl, rel=1e-6)
+
+
+def test_exit_realizes_final_carry_leg_on_old_notional() -> None:
+    """An EXIT's post-fill notional is zero — the carried position must still realize
+    its final mark->exit-fill move (pre-fix code realized exactly 0 on the exit bar)."""
+    ts = [TS0 + timedelta(minutes=5 * i) for i in range(2)]
+    planner = _FixedPlanner(
+        [
+            CandidateAction(action_type=ActionType.ENTER_LONG, size_fraction=1.0),
+            CandidateAction(action_type=ActionType.EXIT, size_fraction=0.0),
+        ]
+    )
+    steps = [
+        BacktestStep(
+            prediction=_pred_nospec(ts[0]), market=_market_nospec(ts[0]),
+            realized_return=0.0, carry_return=0.0, fill_to_mark_return=0.01,
+        ),
+        BacktestStep(
+            prediction=_pred_nospec(ts[1]), market=_market_nospec(ts[1]),
+            realized_return=0.0, carry_return=0.02, fill_to_mark_return=0.0,
+        ),
+    ]
+    cap = 500_000.0
+    report = BacktestEngine(planner, TransactionCosts(CostModelConfig())).run(
+        steps, _account(cap), RISK
+    )
+    # Entry bar: +1% on notional; exit bar: +2% carry on the OLD notional. Without the
+    # carry leg the exit bar contributes only -cost and total lands near 1%.
+    assert report.net_pnl > 0.025 * cap

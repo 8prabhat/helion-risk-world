@@ -1,7 +1,8 @@
 """Stage 4: supervised head fine-tuning on triple-barrier labels (SPEC.md §20, Stage 4).
 
 Fine-tunes the distribution heads (barrier, volatility, regime, return-quantile) of a
-pre-trained HRWForecaster using labeled data from the BarrierLabeler.
+pre-trained HRWForecaster using labeled data from ``data/alpha_labels.py``'s
+``build_alpha_labels`` (Phase 2 migration).
 
 Two modes:
   freeze_encoder=True  (default) — only head parameters optimised; encoder is frozen.

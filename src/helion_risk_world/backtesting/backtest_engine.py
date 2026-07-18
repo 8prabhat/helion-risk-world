@@ -46,6 +46,28 @@ class BacktestStep:
     """Timestamp the realized_return label actually became known (review finding
     H8) — lets LeakageReport.run() verify label_realized_at > ts for real,
     instead of the check being silently skipped."""
+    carry_return: float = 0.0
+    """Market return on a position CARRIED into this step, from the previous
+    step's mark (decision-bar close) to this step's fill price (next-bar open).
+    Settled against the pre-fill notional so an EXIT still realizes the final
+    close→open gap. 0.0 for legacy/synthetic constructors (no carry leg)."""
+    fill_to_mark_return: float | None = None
+    """Market return from this step's fill price (next-bar open) to that bar's
+    close — the ONE-BAR mark-to-market return settled against the post-fill
+    notional. When ``None`` (legacy/synthetic constructors) the engine falls
+    back to ``realized_return``, preserving one-shot semantics for tests that
+    treat each step as a self-contained trade.
+
+    Settlement-bug fix (2026-07-18): the real-data step builders used to put the
+    full H-bar forward label (``closes[i+H]/opens[i+1] − 1``) into
+    ``realized_return`` AND the engine settled ``notional × realized_return``
+    every bar — so a position held K bars accrued K overlapping H-bar returns
+    (≈K× P&L overstatement in either direction), and a 1-bar hold realized a
+    full H-bar move. With this field populated, each held bar settles only its
+    own bar's mark-to-market move and a trade's total P&L telescopes to the
+    actual entry-fill→exit-fill return. ``realized_return`` remains the H-bar
+    label for prediction-quality/leakage checks only — it is no longer the
+    settlement quantity on the real path."""
 
 
 @dataclass
@@ -196,13 +218,19 @@ class BacktestEngine:
             last_session_date = session_date
             prev_capital = state.capital
             prev_state = state
+            settlement_return = (
+                step.fill_to_mark_return
+                if step.fill_to_mark_return is not None
+                else step.realized_return
+            )
             state = PortfolioWorld.apply_fill(
                 state,
                 final,
-                step.realized_return,
+                settlement_return,
                 cost,
                 effective_risk.max_exposure,
                 market=execution_market,
+                carry_return=step.carry_return,
             )
             net_step = state.capital - prev_capital
             gross_step = net_step + cost

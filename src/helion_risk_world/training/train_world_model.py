@@ -21,6 +21,7 @@ import torch
 from torch import Tensor
 
 from helion_risk_world.config.training_config import TrainingConfig
+from helion_risk_world.encoders.option_surface_encoder import SurfaceTensors
 from helion_risk_world.evaluation import world_model_metrics
 from helion_risk_world.losses.rssm_loss import RSSMLoss, kl_balanced
 from helion_risk_world.model import HRWWorldModel
@@ -45,6 +46,7 @@ class WorldModelTrainer:
         *,
         futures_seq: Tensor | None = None,
         regime_seq: Tensor | None = None,
+        surface_seq: SurfaceTensors | None = None,
     ) -> Tensor:
         """Encode a raw feature sequence into RSSM-compatible embeddings.
 
@@ -53,6 +55,9 @@ class WorldModelTrainer:
             model:   HRWWorldModel with a trained (or pre-trained) encoder E_φ.
             futures_seq: optional [T, B, L, F_fut] futures microstructure windows.
             regime_seq: optional [T, B, K] regime-context rows.
+            surface_seq: optional ``SurfaceTensors`` whose ``grid``/``mask``/``context``
+                fields are each ``[T, B, ...]`` option-surface tensors (feature-onboarding
+                pass).
 
         Returns:
             seq_e: [T, B, embed_dim] — pre-encoded embeddings for RSSMLoss.
@@ -64,8 +69,8 @@ class WorldModelTrainer:
         Moves inputs to ``model``'s own device before encoding: callers may invoke
         this after Stage-2 pretraining has already moved ``model`` off CPU (e.g.
         ``MarketStatePretrainer.fit()``, which calls ``model.to(device)``
-        internally), while ``raw_seq``/``futures_seq``/``regime_seq`` — built
-        directly from the original CPU-resident batches — would otherwise still be
+        internally), while ``raw_seq``/``futures_seq``/``regime_seq``/``surface_seq`` —
+        built directly from the original CPU-resident batches — would otherwise still be
         on CPU, crashing with a device-mismatch error inside the encoder's Linear
         layers.
         """
@@ -75,6 +80,8 @@ class WorldModelTrainer:
             futures_seq = futures_seq.to(device)
         if regime_seq is not None:
             regime_seq = regime_seq.to(device)
+        if surface_seq is not None:
+            surface_seq = SurfaceTensors(*(t.to(device) for t in surface_seq))
         T = raw_seq.shape[0]
         with torch.no_grad():
             return torch.stack(
@@ -83,6 +90,9 @@ class WorldModelTrainer:
                         raw_seq[t],
                         futures_seq[t] if futures_seq is not None else None,
                         regime_seq[t] if regime_seq is not None else None,
+                        SurfaceTensors(surface_seq.grid[t], surface_seq.mask[t], surface_seq.context[t])
+                        if surface_seq is not None
+                        else None,
                     )
                     for t in range(T)
                 ],

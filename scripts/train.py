@@ -12,6 +12,7 @@ Usage:
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,7 @@ from helion_risk_world.heads.regime_head import REGIME_CLASSES
 from helion_risk_world.heads.return_head import DEFAULT_QUANTILES
 from helion_risk_world.losses.composite_loss import ForecasterLoss
 from helion_risk_world.losses.world_model_loss import WorldModelLoss
+from helion_risk_world.encoders.option_surface_encoder import SurfaceTensors
 from helion_risk_world.model import HRWForecaster, HRWWorldModel
 from helion_risk_world.prediction_calibration import fit_prediction_calibration
 from helion_risk_world.schemas.label_schema import (
@@ -65,6 +67,7 @@ from helion_risk_world.training.artifacts import (
     save_forecaster_artifact,
     save_world_model_artifact,
 )
+from helion_risk_world.training.checkpoint_metrics import trading_utility_loss
 from helion_risk_world.training.opportunity_weighting import (
     OpportunityWeightAudit,
     compute_management_opportunity_weights,
@@ -75,12 +78,36 @@ from helion_risk_world.training.train_heads import HeadTrainer
 from helion_risk_world.training.train_world_model import WorldModelTrainer
 from helion_risk_world.training.trainer import ForecastBatch, HRWTrainer
 
+from alpha_data.io.paths import DataPaths as AlphaDataPaths
+
+def _futures_data_available(universe: tuple[str, ...], base_interval: str) -> bool:
+    """Whether alpha_data's real futures-microstructure parquet exists for this
+    universe's primary underlying -- what actually gates whether
+    ``AlphaDataFuturesWindowBuilder`` can be constructed (Phase 2 migration; this
+    replaced the old ``data/processed/banknifty_5min.parquet``-existence check, which
+    stopped being produced once ``scripts/assemble_data.py`` was deleted)."""
+    path = AlphaDataPaths().features / f"{universe[0]}_FUT_futures_microstructure_{base_interval}.parquet"
+    return path.exists()
+
+
+def _option_surface_data_available(universe: tuple[str, ...], base_interval: str) -> bool:
+    """Whether alpha_data has ingested at least one real option-surface cycle for this
+    universe's primary underlying (feature-onboarding pass) -- gates whether
+    ``CompositeMarketDataSource``/``AlphaDataOptionChainSource`` can supply real chains.
+    Coverage may still be partial across the full label history (options data starts
+    later than equity/futures OHLCV); rows outside covered cycles get a zero-filled,
+    all-masked surface rather than being excluded from training (see
+    ``FeatureBuilder.build_surface_history``)."""
+    paths = AlphaDataPaths()
+    return any(paths.options.glob(f"{universe[0]}_SURFACE_CE_*_{base_interval}_greeks.parquet"))
+
+
 _BARRIER_IDX = {Barrier.STOP: 0, Barrier.TARGET: 1, Barrier.TIMEOUT: 2}
 _MIN_LABEL_SCHEMA_VERSION = 5
 _REGIME_LOOKBACK = 12
 _LOG_RETURN_IDX = CANDLE_FEATURE_NAMES.index("log_return")
 _DEFAULT_WORLD_MODEL_SEQ_BATCHES = 16
-_SUPPORTED_BARRIER_MODES = {"legacy", "derived"}
+_SUPPORTED_BARRIER_MODES = {"legacy", "derived", "decomposed"}
 _SUPPORTED_RETURN_TARGET_MODES = {"exit", "horizon", "timeout"}
 
 
@@ -675,9 +702,8 @@ def build_market_pretrain_pairs(
         }
     )
     source = ParquetMarketDataSource(data_dir=data_dir, universe=universe, base_interval=base_interval)
-    vix_path = Path(data_dir) / "ohlcv" / "INDIAVIX_5min.parquet"
+    vix_path = Path(data_dir) / "ohlcv" / f"INDIAVIX_{base_interval}.parquet"
     ctx_path = Path(data_dir) / "regime" / "daily_context.parquet"
-    fut_path = Path(data_dir) / "processed" / "banknifty_5min.parquet"
     inputs = ModelInputBuilder.from_data_dir(
         dc,
         source,
@@ -685,7 +711,7 @@ def build_market_pretrain_pairs(
         contract=ModelInputContract.from_data_config(
             dc,
             feature_names=CANDLE_FEATURE_NAMES,
-            uses_futures=fut_path.exists(),
+            uses_futures=_futures_data_available(universe, base_interval),
             uses_regime_context=True,
             require_vix=vix_path.exists(),
             require_daily_context=False,
@@ -734,12 +760,17 @@ def _chunk_batch(
     barrier_weight: np.ndarray | None = None,     # [N]
     regime_context: np.ndarray | None = None,   # [N, K]
     futures: np.ndarray | None = None,           # [N, L, 12]
+    surface_grid: np.ndarray | None = None,      # [N, S, C]
+    surface_mask: np.ndarray | None = None,      # [N, S]
+    surface_context: np.ndarray | None = None,   # [N, K_surface]
     sample_weight: np.ndarray | None = None,     # [N]
     horizon_returns: np.ndarray | None = None,   # [N, H]
     horizon_volatility: np.ndarray | None = None,   # [N, H]
     horizon_mae: np.ndarray | None = None,       # [N, H]
     horizon_mfe: np.ndarray | None = None,       # [N, H]
     barrier_context: np.ndarray | None = None,   # [N, 3] sigma + explicit stop/target returns
+    primary_side: np.ndarray | None = None,      # [N] float in {-1,0,1}
+    meta_label: np.ndarray | None = None,        # [N] float in {0,1}, NaN where primary_side==0
     target_horizons: tuple[int, ...] = (),
     batch_size: int,
 ) -> list[ForecastBatch]:
@@ -797,6 +828,21 @@ def _chunk_batch(
                     if futures is not None
                     else None
                 ),
+                surface_grid=(
+                    torch.tensor(surface_grid[start:end], dtype=torch.float32)
+                    if surface_grid is not None
+                    else None
+                ),
+                surface_mask=(
+                    torch.tensor(surface_mask[start:end], dtype=torch.float32)
+                    if surface_mask is not None
+                    else None
+                ),
+                surface_context=(
+                    torch.tensor(surface_context[start:end], dtype=torch.float32)
+                    if surface_context is not None
+                    else None
+                ),
                 sample_weight=(
                     torch.tensor(sample_weight[start:end], dtype=torch.float32)
                     if sample_weight is not None
@@ -825,6 +871,16 @@ def _chunk_batch(
                 barrier_context=(
                     torch.tensor(barrier_context[start:end], dtype=torch.float32)
                     if barrier_context is not None
+                    else None
+                ),
+                primary_side=(
+                    torch.tensor(primary_side[start:end], dtype=torch.float32)
+                    if primary_side is not None
+                    else None
+                ),
+                meta_label=(
+                    torch.tensor(meta_label[start:end], dtype=torch.float32)
+                    if meta_label is not None
                     else None
                 ),
                 target_horizons=target_horizons,
@@ -1018,9 +1074,9 @@ def build_labeled_batches(
     split_total = len(labels)
     resolved_barrier_spec = barrier_spec or _resolve_barrier_spec(labels)
 
-    vix_path = Path(data_dir) / "ohlcv" / "INDIAVIX_5min.parquet"
+    vix_path = Path(data_dir) / "ohlcv" / f"INDIAVIX_{base_interval}.parquet"
     ctx_path = Path(data_dir) / "regime" / "daily_context.parquet"
-    fut_path = Path(data_dir) / "processed" / "banknifty_5min.parquet"
+    uses_option_surface = _option_surface_data_available(universe, base_interval)
     inputs = ModelInputBuilder.from_data_dir(
         dc,
         source,
@@ -1028,8 +1084,9 @@ def build_labeled_batches(
         contract=ModelInputContract.from_data_config(
             dc,
             feature_names=CANDLE_FEATURE_NAMES,
-            uses_futures=fut_path.exists(),
+            uses_futures=_futures_data_available(universe, base_interval),
             uses_regime_context=True,
+            uses_option_surface=uses_option_surface,
             require_vix=vix_path.exists(),
             require_daily_context=False,
             barrier_stop_mult=resolved_barrier_spec.stop_mult,
@@ -1131,25 +1188,6 @@ def build_labeled_batches(
             ].to_numpy(dtype=np.float32),
             dtype=np.float32,
         )
-    elif fut_path.exists():
-        log.warning(
-            "train.barrier_context_missing fallback=%s stop_mult=%s target_mult=%s vol_span=%s",
-            "recompute_from_tradeable_series",
-            resolved_barrier_spec.stop_mult,
-            resolved_barrier_spec.target_mult,
-            resolved_barrier_spec.vol_span,
-        )
-        barrier_frame = pd.read_parquet(fut_path)
-        barrier_frame.index = pd.to_datetime(barrier_frame.index)
-        close_col = "close_fut" if "close_fut" in barrier_frame.columns else "close"
-        barrier_close = barrier_frame[close_col].to_numpy(dtype=float)
-        barrier_positions = barrier_frame.index.get_indexer(pd.DatetimeIndex(labels.index))
-        if np.any(barrier_positions < 0):
-            raise ValueError("labeled rows are missing from the tradeable futures target series")
-        barrier_context_arr = barrier_context_series(
-            barrier_close,
-            spec=resolved_barrier_spec,
-        )[barrier_positions].astype(np.float32, copy=False)
 
     regime_context_arr = np.zeros((len(labels), len(REGIME_CONTEXT_FEATURES)), dtype=np.float32)
     regime_values = labels["regime"] if "regime" in labels.columns else pd.Series([np.nan] * len(labels), index=labels.index)
@@ -1170,6 +1208,25 @@ def build_labeled_batches(
             )
     regime_arr = np.array(regimes, dtype=np.int64)
 
+    # Option-surface tensors, one per label row (feature-onboarding pass). Chains are
+    # looked up per-timestamp (no vectorized alpha_data chain-history equivalent, unlike
+    # candles/futures/regime above) -- see FeatureBuilder.build_surface_history's docstring.
+    # Rows outside covered option-surface cycles come back zero-filled/all-masked rather
+    # than excluded, so this never shrinks the already-scarce labeled training set.
+    surface_grid_arr = surface_mask_arr = surface_context_arr = None
+    if uses_option_surface:
+        surface_grid_arr, surface_mask_arr, surface_context_arr, surface_eligible = (
+            inputs.feature_builder.build_surface_history(
+                [pd.Timestamp(ts).to_pydatetime() for ts in labels.index]
+            )
+        )
+        log.info(
+            "train.option_surface_coverage",
+            split=split,
+            eligible_rows=int(surface_eligible.sum()),
+            total_rows=len(labels),
+        )
+
     futures_arr = None
     if futures_windows is not None and futures_positions is not None:
         futures_arr = np.ascontiguousarray(
@@ -1186,79 +1243,29 @@ def build_labeled_batches(
         horizon_vol_arr = np.zeros((len(labels), len(sorted_horizons)), dtype=np.float32)
         horizon_mae_arr = np.zeros((len(labels), len(sorted_horizons)), dtype=np.float32)
         horizon_mfe_arr = np.zeros((len(labels), len(sorted_horizons)), dtype=np.float32)
-        missing_horizons = [
-            target_h
-            for target_h in sorted_horizons
-            if horizon_return_column(target_h) not in labels.columns
-            or horizon_volatility_column(target_h) not in labels.columns
-            or horizon_mae_column(target_h) not in labels.columns
-            or horizon_mfe_column(target_h) not in labels.columns
-        ]
-        assembled = None
-        target_open = None
-        target_high = None
-        target_low = None
-        target_close = None
-        target_positions = None
-        if missing_horizons:
-            log.warning(
-                "train.fixed_horizon_columns_missing horizons=%s fallback=%s",
-                missing_horizons,
-                "recompute_from_tradeable_series",
-            )
-            assembled = pd.read_parquet(fut_path)
-            assembled.index = pd.to_datetime(assembled.index)
-            open_col = "open_fut" if "open_fut" in assembled.columns else "open"
-            high_col = "high_fut" if "high_fut" in assembled.columns else "high"
-            low_col = "low_fut" if "low_fut" in assembled.columns else "low"
-            close_col = "close_fut" if "close_fut" in assembled.columns else "close"
-            target_open = assembled[open_col].to_numpy(dtype=float)
-            target_high = assembled[high_col].to_numpy(dtype=float)
-            target_low = assembled[low_col].to_numpy(dtype=float)
-            target_close = assembled[close_col].to_numpy(dtype=float)
-            target_positions = assembled.index.get_indexer(pd.DatetimeIndex(labels.index))
-            if np.any(target_positions < 0):
-                raise ValueError("labeled rows are missing from the tradeable futures target series")
         for horizon_idx, target_h in enumerate(sorted_horizons):
             ret_col = horizon_return_column(target_h)
             vol_col = horizon_volatility_column(target_h)
             mae_col = horizon_mae_column(target_h)
             mfe_col = horizon_mfe_column(target_h)
-            if ret_col in labels.columns and vol_col in labels.columns and mae_col in labels.columns and mfe_col in labels.columns:
-                horizon_returns_arr[:, horizon_idx] = labels[ret_col].to_numpy(dtype=np.float32)
-                horizon_vol_arr[:, horizon_idx] = np.maximum(
-                    labels[vol_col].to_numpy(dtype=np.float32),
-                    1e-6,
+            if ret_col not in labels.columns or vol_col not in labels.columns or mae_col not in labels.columns or mfe_col not in labels.columns:
+                raise ValueError(
+                    f"labels.parquet is missing fixed-horizon columns for horizon={target_h}; "
+                    f"regenerate via scripts/label.py with --target-horizons including {target_h}"
                 )
-                horizon_mae_arr[:, horizon_idx] = np.maximum(
-                    labels[mae_col].to_numpy(dtype=np.float32),
-                    0.0,
-                )
-                horizon_mfe_arr[:, horizon_idx] = np.maximum(
-                    labels[mfe_col].to_numpy(dtype=np.float32),
-                    0.0,
-                )
-                continue
-            assert (
-                target_open is not None
-                and target_high is not None
-                and target_low is not None
-                and target_close is not None
-                and target_positions is not None
+            horizon_returns_arr[:, horizon_idx] = labels[ret_col].to_numpy(dtype=np.float32)
+            horizon_vol_arr[:, horizon_idx] = np.maximum(
+                labels[vol_col].to_numpy(dtype=np.float32),
+                1e-6,
             )
-            for row_idx, decision_pos in enumerate(target_positions):
-                h_ret, h_vol, h_mae, h_mfe = _fixed_horizon_targets(
-                    target_open,
-                    target_high,
-                    target_low,
-                    target_close,
-                    decision_pos=int(decision_pos),
-                    horizon=target_h,
-                )
-                horizon_returns_arr[row_idx, horizon_idx] = h_ret
-                horizon_vol_arr[row_idx, horizon_idx] = h_vol
-                horizon_mae_arr[row_idx, horizon_idx] = h_mae
-                horizon_mfe_arr[row_idx, horizon_idx] = h_mfe
+            horizon_mae_arr[:, horizon_idx] = np.maximum(
+                labels[mae_col].to_numpy(dtype=np.float32),
+                0.0,
+            )
+            horizon_mfe_arr[:, horizon_idx] = np.maximum(
+                labels[mfe_col].to_numpy(dtype=np.float32),
+                0.0,
+            )
 
     log.info(
         "train.labels_aligned",
@@ -1281,6 +1288,21 @@ def build_labeled_batches(
         else return_targets.realized_vol,
         1e-6,
     )
+    # Meta-labeling columns (2026-07-18, see labeling/meta_labels.py). Absent entirely for
+    # labels.parquet files generated before LABEL_SCHEMA_VERSION 9 -- None here means
+    # ForecastBatch.primary_side/meta_label stay None and the loss's meta-label term is
+    # simply inert (see ForecasterLoss.forward's `meta_label is not None` guard), so old
+    # label files keep training exactly as before, no error.
+    primary_side_arr = (
+        labels["primary_side"].to_numpy(dtype=np.float32)
+        if "primary_side" in labels.columns
+        else None
+    )
+    meta_label_arr = (
+        labels["meta_label"].to_numpy(dtype=np.float32)
+        if "meta_label" in labels.columns
+        else None
+    )
     return _chunk_batch(
         features=feats,
         forward_return=return_targets.forward_return,
@@ -1295,12 +1317,17 @@ def build_labeled_batches(
         barrier_weight=barrier_weight_arr,
         regime_context=regime_context_arr,
         futures=futures_arr,
+        surface_grid=surface_grid_arr,
+        surface_mask=surface_mask_arr,
+        surface_context=surface_context_arr,
         sample_weight=weight_arr,
         horizon_returns=horizon_returns_arr,
         horizon_volatility=horizon_vol_arr,
         horizon_mae=horizon_mae_arr,
         horizon_mfe=horizon_mfe_arr,
         barrier_context=barrier_context_arr,
+        primary_side=primary_side_arr,
+        meta_label=meta_label_arr,
         target_horizons=sorted_horizons,
         batch_size=batch_size,
     )
@@ -1333,6 +1360,15 @@ def _ood_optional(batches: list[ForecastBatch], attr: str, limit: int = 4096) ->
     return torch.cat(rows, dim=0) if rows else None
 
 
+def _ood_surface(batches: list[ForecastBatch], limit: int = 4096) -> SurfaceTensors | None:
+    grid = _ood_optional(batches, "surface_grid", limit)
+    mask = _ood_optional(batches, "surface_mask", limit)
+    context = _ood_optional(batches, "surface_context", limit)
+    if grid is None or mask is None or context is None:
+        return None
+    return SurfaceTensors(grid=grid, mask=mask, context=context)
+
+
 def _input_contract(
     dc,
     data_dir: str | None,
@@ -1340,16 +1376,19 @@ def _input_contract(
     *,
     barrier_spec: BarrierSpec,
 ) -> ModelInputContract:
-    vix_exists = bool(data_dir and (Path(data_dir) / "ohlcv" / "INDIAVIX_5min.parquet").exists())
+    vix_exists = bool(
+        data_dir and (Path(data_dir) / "ohlcv" / f"INDIAVIX_{dc.base_interval}.parquet").exists()
+    )
     daily_exists = bool(data_dir and (Path(data_dir) / "regime" / "daily_context.parquet").exists())
     uses_futures = any(batch.futures is not None for batch in batches)
     uses_regime_context = any(batch.regime_context is not None for batch in batches)
+    uses_option_surface = any(batch.surface_grid is not None for batch in batches)
     return ModelInputContract.from_data_config(
         dc,
         feature_names=CANDLE_FEATURE_NAMES,
         uses_futures=uses_futures,
         uses_regime_context=uses_regime_context,
-        uses_option_surface=False,
+        uses_option_surface=uses_option_surface,
         require_vix=vix_exists,
         require_daily_context=False,
         barrier_stop_mult=barrier_spec.stop_mult,
@@ -1364,6 +1403,8 @@ def _enabled_encoders(batches: list[ForecastBatch]) -> tuple[str, ...]:
     names = ["temporal", "cross_asset"]
     if any(batch.futures is not None for batch in batches):
         names.append("futures")
+    if any(batch.surface_grid is not None for batch in batches):
+        names.append("option_surface")
     if any(batch.regime_context is not None for batch in batches):
         names.append("regime")
     return tuple(names)
@@ -1380,12 +1421,15 @@ def _build_world_model_sequences(
     seq_len: int,
     seq_batch_size: int = _DEFAULT_WORLD_MODEL_SEQ_BATCHES,
     seq_stride: int | None = None,
-) -> list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]:
+) -> list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, SurfaceTensors | None]]:
     features = _concat_batch_attr(batches, "features")
     if features is None or features.shape[0] < seq_len:
         raise ValueError("insufficient chronological rows for world-model sequence training")
     futures = _concat_batch_attr(batches, "futures")
     regime_context = _concat_batch_attr(batches, "regime_context")
+    surface_grid = _concat_batch_attr(batches, "surface_grid")
+    surface_mask = _concat_batch_attr(batches, "surface_mask")
+    surface_context = _concat_batch_attr(batches, "surface_context")
 
     stride = seq_stride if seq_stride is not None else max(1, seq_len // 2)
     if stride < 1:
@@ -1396,7 +1440,7 @@ def _build_world_model_sequences(
         starts.append(last_start)
     if not starts:
         raise ValueError("no sequence start positions available for world-model training")
-    sequences: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = []
+    sequences: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, SurfaceTensors | None]] = []
     for chunk_start in range(0, len(starts), seq_batch_size):
         chunk = starts[chunk_start : chunk_start + seq_batch_size]
         raw_seq = torch.stack([features[start : start + seq_len] for start in chunk], dim=1)
@@ -1410,7 +1454,18 @@ def _build_world_model_sequences(
             if regime_context is not None
             else None
         )
-        sequences.append((raw_seq, fut_seq, reg_seq))
+        surf_seq = (
+            SurfaceTensors(
+                grid=torch.stack([surface_grid[start : start + seq_len] for start in chunk], dim=1),
+                mask=torch.stack([surface_mask[start : start + seq_len] for start in chunk], dim=1),
+                context=torch.stack(
+                    [surface_context[start : start + seq_len] for start in chunk], dim=1
+                ),
+            )
+            if surface_grid is not None and surface_mask is not None and surface_context is not None
+            else None
+        )
+        sequences.append((raw_seq, fut_seq, reg_seq, surf_seq))
     return sequences
 
 
@@ -1455,6 +1510,9 @@ def _resolved_fold_labels(labels: pd.DataFrame, row_slice: slice) -> pd.DataFram
     return subset.sort_index()
 
 
+_CHECKPOINT_METRICS: dict[str, object] = {"loss": None, "trading_utility": trading_utility_loss}
+
+
 def _train_model_once(
     *,
     model_kind: str,
@@ -1468,6 +1526,7 @@ def _train_model_once(
     val_batches: list[ForecastBatch] | None = None,
     fit_epochs: int | None = None,
     rssm_epochs: int | None = None,
+    checkpoint_metric_name: str = "loss",
 ) -> _TrainingOutcome:
     if model_kind == "world_model":
         model = HRWWorldModel(
@@ -1493,8 +1552,10 @@ def _train_model_once(
             seq_len=max(target_horizons),
         )
         encoded_sequences = [
-            WorldModelTrainer.encode_sequence(raw_seq, model, futures_seq=fut_seq, regime_seq=reg_seq)
-            for raw_seq, fut_seq, reg_seq in sequence_inputs
+            WorldModelTrainer.encode_sequence(
+                raw_seq, model, futures_seq=fut_seq, regime_seq=reg_seq, surface_seq=surf_seq
+            )
+            for raw_seq, fut_seq, reg_seq, surf_seq in sequence_inputs
         ]
         rssm_trainer = WorldModelTrainer(model, train_cfg)
         rssm_trainer.fit(encoded_sequences, epochs=rssm_epochs)
@@ -1512,7 +1573,14 @@ def _train_model_once(
     else:
         loss = ForecasterLoss(weights=loss_weights)
 
-    trainer = HRWTrainer(model, loss, train_cfg)
+    if checkpoint_metric_name not in _CHECKPOINT_METRICS:
+        raise ValueError(
+            f"unsupported checkpoint_metric_name: {checkpoint_metric_name!r} "
+            f"(choices: {sorted(_CHECKPOINT_METRICS)})"
+        )
+    trainer = HRWTrainer(
+        model, loss, train_cfg, checkpoint_metric=_CHECKPOINT_METRICS[checkpoint_metric_name]
+    )
     trainer.fit(batches, epochs=fit_epochs, val_batches=val_batches or None)
 
     # Stage 4 (review finding H7): optional head-only fine-tuning pass on top of
@@ -1529,6 +1597,7 @@ def _train_model_once(
         _ood_features(batches),
         futures=_ood_optional(batches, "futures"),
         regime=_ood_optional(batches, "regime_context"),
+        surface=_ood_surface(batches),
     )
     return _TrainingOutcome(
         model=model,
@@ -1557,11 +1626,26 @@ def _collect_prediction_calibration_inputs(
     with torch.no_grad():
         for batch in batches:
             batch_device = batch.to(device)
+            surface = None
+            if (
+                batch_device.surface_grid is not None
+                and batch_device.surface_mask is not None
+                and batch_device.surface_context is not None
+            ):
+                surface = SurfaceTensors(
+                    grid=batch_device.surface_grid,
+                    mask=batch_device.surface_mask,
+                    context=batch_device.surface_context,
+                )
+            forward_kwargs: dict[str, object] = {}
+            if surface is not None and "surface" in inspect.signature(model.forward).parameters:
+                forward_kwargs["surface"] = surface
             output = model.forward(
                 batch_device.features,
                 batch_device.futures,
                 batch_device.regime_context,
                 batch_device.barrier_context,
+                **forward_kwargs,
             )
             if model_kind == "world_model":
                 pred_quantiles = output["return_quantiles"].detach().cpu().numpy()
@@ -1652,6 +1736,10 @@ def _fit_posthoc_prediction_calibration(
     if not allow_class_probability_temperatures:
         metadata["barrier_temperature"] = 1.0
         metadata["regime_temperature"] = 1.0
+        # The prior-offset correction (2026-07-18) is a class-probability transform
+        # too — strip it under the same gate so "classification transfer disabled"
+        # really means identity on the class probabilities.
+        metadata.pop("barrier_prior_offsets", None)
         metadata["classification_transfer_disabled"] = True
     return metadata
 
@@ -1835,6 +1923,7 @@ def main() -> None:
             "model_path",
             "model_kind",
             "pretraining",
+            "checkpoint_metric",
         ),
     )
     dc = data_config_from_cfg(cfg)
@@ -1849,6 +1938,16 @@ def main() -> None:
     loss_weights = loss_weights_from_cfg(cfg)
     execution_cfg = execution_config_from_cfg(cfg)
     train_cfg = training_config_from_cfg(cfg)
+    # Bugfix (2026-07-13): `--seed` was accepted, logged, and applied to Python's/numpy's
+    # RNGs inside `setup()` -- but never threaded into `TrainingConfig.seed`, which is what
+    # `HRWTrainer.fit()` actually calls `torch.manual_seed()` with. Since every actual
+    # weight-init/dropout/batch-order source of randomness in this codebase goes through
+    # torch, `--seed` was a complete no-op for training reproducibility/variation --
+    # confirmed empirically (two runs differing only in `--seed` produced byte-identical
+    # calibration metrics to 7 decimal places). `setup()` doesn't expose its own resolved
+    # seed value, so it's recomputed here with the same precedence (CLI overrides config).
+    resolved_seed = args.seed if getattr(args, "seed", None) is not None else train_cfg.seed
+    train_cfg = replace(train_cfg, seed=resolved_seed)
     train_cfg = replace(train_cfg, embargo_bars=max(train_cfg.embargo_bars, horizon))
     rssm_epochs = (
         int(args.rssm_epochs)
@@ -1939,7 +2038,20 @@ def main() -> None:
         )
         if model_selection_summary is not None:
             supervised_fit_epochs = int(model_selection_summary["selected_supervised_epochs"])
-            training_split = "pretest"
+            # Final-refit validation (2026-07-12 fix): this used to train on the FULL "pretest"
+            # split (train+val combined) with val_batches=[] -- HRWTrainer.fit() only restores
+            # the best checkpoint when val_batches is non-empty, so this stage (unlike each CV
+            # fold, which does track best_val_loss and roll back) never benefited from that
+            # safeguard. Confirmed empirically: this final refit's own loss curve is
+            # non-monotonic (one run's loss rose from 13.37 at epoch 16 back up to 13.98 by
+            # epoch 24, with no mechanism to recover the better checkpoint -- the reported
+            # "final" model was whatever the fixed epoch count happened to land on, not its own
+            # best point). Training on "train"/validating on "val" (the same split_manifest
+            # boundary the non-CV code path below already uses correctly) costs some final
+            # training data (val is held out, not just an internal CV slice) but makes
+            # `selected_supervised_epochs` a genuine ceiling with real early-stopping/
+            # best-checkpoint selection underneath it, not a blind fixed count.
+            training_split = "train"
             batches = build_labeled_batches(
                 args.data_dir,
                 dc.universe,
@@ -1949,12 +2061,28 @@ def main() -> None:
                 management_horizon=horizon,
                 execution_cfg=execution_cfg,
                 batch_size=train_cfg.batch_size,
-                split="pretest",
+                split="train",
                 split_manifest=split_manifest,
                 target_horizons=target_horizons if args.model_kind == "world_model" else None,
                 return_target_mode=return_target_mode,
             )
-            val_batches = []
+            try:
+                val_batches = build_labeled_batches(
+                    args.data_dir,
+                    dc.universe,
+                    dc.base_interval,
+                    dc.lookback_bars,
+                    labels,
+                    management_horizon=horizon,
+                    execution_cfg=execution_cfg,
+                    batch_size=train_cfg.batch_size,
+                    split="val",
+                    split_manifest=split_manifest,
+                    target_horizons=target_horizons if args.model_kind == "world_model" else None,
+                    return_target_mode=return_target_mode,
+                )
+            except ValueError:
+                val_batches = []
             if train_cfg.pretrain_epochs > 0:
                 pretrain_pairs = build_market_pretrain_pairs(
                     args.data_dir,
@@ -1963,7 +2091,7 @@ def main() -> None:
                     dc.lookback_bars,
                     batch_size=train_cfg.batch_size,
                     gap_bars=train_cfg.pretrain_gap_bars,
-                    split="pretest",
+                    split="train",
                     split_manifest=split_manifest,
                 )
         else:
@@ -2053,6 +2181,7 @@ def main() -> None:
         val_batches=val_batches,
         fit_epochs=supervised_fit_epochs,
         rssm_epochs=rssm_epochs if args.model_kind == "world_model" else None,
+        checkpoint_metric_name=getattr(args, "checkpoint_metric", None) or "loss",
     )
     model = outcome.model
     trainer = outcome.trainer
@@ -2076,11 +2205,19 @@ def main() -> None:
             first_loss=round(outcome.rssm_trainer.history[0], 6),
             last_loss=round(outcome.rssm_trainer.history[-1], 6),
         )
-    if model_selection_summary is not None:
-        candidate = model_selection_summary.get("prediction_calibration")
-        if isinstance(candidate, dict):
-            prediction_calibration = candidate
-    elif val_batches:
+    # Bugfix (2026-07-13): the walk-forward-CV path used to unconditionally inherit its OOF
+    # calibration fit, which forces barrier_temperature/regime_temperature to 1.0 (identity --
+    # see `_fit_posthoc_prediction_calibration`'s `allow_class_probability_temperatures=False`)
+    # because those OOF probabilities come from the 5 different FOLD models, not the actual
+    # final model being evaluated/deployed -- transferring a class-probability temperature
+    # across different model instances is unsafe. Confirmed empirically: barrier_temperature
+    # was exactly 1.0 in every walk-forward-CV run this session, and barrier_brier/ECE never
+    # improved from it. Now that the final refit always has genuine held-out `val_batches`
+    # (see the walk-forward-CV branch above, fixed the same day), fit the calibration --
+    # INCLUDING class-probability temperatures -- directly from the actual final model's own
+    # val-split predictions instead, falling back to the OOF-CV summary only if val_batches
+    # is unexpectedly empty.
+    if val_batches:
         prediction_calibration = _fit_posthoc_prediction_calibration(
             _collect_prediction_calibration_inputs(
                 model,
@@ -2090,6 +2227,10 @@ def main() -> None:
             ),
             source="val_split",
         )
+    elif model_selection_summary is not None:
+        candidate = model_selection_summary.get("prediction_calibration")
+        if isinstance(candidate, dict):
+            prediction_calibration = candidate
     if prediction_calibration is not None:
         log.info(
             "train.prediction_calibration",

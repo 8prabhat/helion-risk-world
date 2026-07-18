@@ -15,10 +15,7 @@ from helion_risk_world.data.leakage_checks import (
     assert_no_portfolio_in_market,
     assert_point_in_time,
 )
-from helion_risk_world.data.market_window_builder import (
-    CANDLE_FEATURE_NAMES,
-    MarketWindowBuilder,
-)
+from helion_risk_world.data.market_window_builder import CANDLE_FEATURE_NAMES
 from helion_risk_world.data.option_surface_builder import (
     OptionSurfaceBuilder,
     infer_strike_step,
@@ -32,7 +29,6 @@ __all__ = [
     "MarketBatch",
     "MarketDataSource",
     "InMemoryMarketDataSource",
-    "MarketWindowBuilder",
     "CANDLE_FEATURE_NAMES",
     "OptionSurfaceBuilder",
     "infer_strike_step",

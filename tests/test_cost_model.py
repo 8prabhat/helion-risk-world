@@ -31,12 +31,17 @@ def test_scales_with_half_spread() -> None:
     assert wider_spread > base
 
 
-def test_is_symmetric_double_of_one_way() -> None:
+def test_stt_and_stamp_duty_are_one_sided_not_doubled() -> None:
+    """Cost-model audit (2026-07-18): STT (sell-side) and stamp duty (buy-side) are each
+    real one-time charges per round trip, not symmetric per-leg charges like brokerage/
+    exchange/GST/SEBI/spread/slippage. Removing them entirely must drop the total by
+    exactly their combined rate (added once), not twice."""
     cfg = CostModelConfig()
     frac = round_trip_cost_frac(cfg, reference_notional=1_500_000.0)
-    one_way = frac / 2.0
-    assert one_way > 0.0
-    assert frac == 2.0 * one_way
+    without_stt_stamp = round_trip_cost_frac(
+        replace(cfg, stt_rate=0.0, stamp_duty_rate=0.0), reference_notional=1_500_000.0
+    )
+    assert frac - without_stt_stamp == pytest.approx(cfg.stt_rate + cfg.stamp_duty_rate)
 
 
 def test_reference_notional_has_minor_sensitivity() -> None:
@@ -72,3 +77,29 @@ def test_overnight_financing_cost_scales_with_notional() -> None:
 def test_overnight_financing_cost_rejects_negative_nights() -> None:
     with pytest.raises(ValueError):
         overnight_financing_cost(CostModelConfig(), notional=1_500_000.0, nights_held=-1)
+
+
+def test_statutory_charges_stt_only_on_sell_and_stamp_duty_only_on_buy() -> None:
+    """Cost-model audit (2026-07-18): the previous implementation charged full STT and
+    stamp duty on every order regardless of side, effectively double-charging both
+    one-sided real-world statutory items. Both fixed rates are non-zero by default, so
+    a genuine bug here would show up as buy_stat == sell_stat instead of an asymmetric
+    split."""
+    from helion_risk_world.execution.cost_model import ConservativeIndianCostModel
+    from helion_risk_world.schemas.execution_schema import CandidateOrder
+
+    cfg = CostModelConfig()
+    model = ConservativeIndianCostModel(cfg)
+    notional = 1_500_000.0
+    buy = CandidateOrder(symbol="BANKNIFTY_FUT_continuous", side="buy", qty=30, notional=notional)
+    sell = CandidateOrder(symbol="BANKNIFTY_FUT_continuous", side="sell", qty=30, notional=notional)
+
+    buy_cost = model.statutory(buy)
+    sell_cost = model.statutory(sell)
+    assert buy_cost != sell_cost
+    # Buy carries stamp duty but not STT; sell carries STT but not stamp duty.
+    assert sell_cost - buy_cost == pytest.approx((cfg.stt_rate - cfg.stamp_duty_rate) * notional)
+    assert (buy_cost + sell_cost) == pytest.approx(
+        round_trip_cost_frac(cfg, reference_notional=notional) * notional
+        - 2 * ((cfg.half_spread_bps + cfg.slippage_bps)) * notional
+    )

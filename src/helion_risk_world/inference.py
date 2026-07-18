@@ -29,11 +29,14 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from helion_risk_world.barrier_context import BarrierContext
+from helion_risk_world.data.option_surface_builder import featurize_surface
 from helion_risk_world.data.regime_builder import featurize_regime
+from helion_risk_world.encoders.option_surface_encoder import SurfaceTensors
 from helion_risk_world.heads.regime_head import REGIME_CLASSES
 from helion_risk_world.heads.return_head import DEFAULT_QUANTILES
 from helion_risk_world.model import HRWForecaster, HRWWorldModel
 from helion_risk_world.schemas.market_schema import EventContext, RegimeContext
+from helion_risk_world.schemas.option_chain_schema import OptionSurfaceSnapshot
 from helion_risk_world.schemas.prediction_schema import (
     BarrierProbabilities,
     HorizonPrediction,
@@ -69,6 +72,39 @@ def _warn_uncalibrated_epistemic_once() -> None:
 def _batch_regime_tensor(regimes: Sequence[RegimeInput], device: torch.device) -> Tensor:
     rows = [featurize_regime(reg, evt) for reg, evt in regimes]
     return torch.tensor(np.stack(rows), device=device)
+
+
+def _batch_surface_tensors(
+    surfaces: Sequence[OptionSurfaceSnapshot | None], device: torch.device
+) -> SurfaceTensors | None:
+    """Batch ``OptionSurfaceSnapshot``s into model-ready ``SurfaceTensors`` (feature-onboarding
+    pass). A ``None`` entry (no chain available at that row) becomes a zero-filled,
+    all-masked row -- same "no signal" convention as ``FeatureBuilder.build_surface_history``,
+    not an excluded row."""
+    if all(s is None for s in surfaces):
+        return None
+    grids, masks, contexts = [], [], []
+    for surf in surfaces:
+        if surf is None:
+            grids.append(None)
+            masks.append(None)
+            contexts.append(None)
+            continue
+        g, m, c = featurize_surface(surf)
+        grids.append(g)
+        masks.append(m)
+        contexts.append(c)
+    shape_g = next(g.shape for g in grids if g is not None)
+    shape_m = next(m.shape for m in masks if m is not None)
+    shape_c = next(c.shape for c in contexts if c is not None)
+    grids = [g if g is not None else np.zeros(shape_g, dtype=np.float32) for g in grids]
+    masks = [m if m is not None else np.zeros(shape_m, dtype=np.float32) for m in masks]
+    contexts = [c if c is not None else np.zeros(shape_c, dtype=np.float32) for c in contexts]
+    return SurfaceTensors(
+        grid=torch.tensor(np.stack(grids), device=device),
+        mask=torch.tensor(np.stack(masks), device=device),
+        context=torch.tensor(np.stack(contexts), device=device),
+    )
 
 
 def _build_horizon_prediction(
@@ -138,8 +174,10 @@ class ForecasterPredictor:
         futures: Tensor | None = None,
         regimes: Sequence[RegimeInput] | None = None,
         barrier_contexts: Sequence[BarrierContext | None] | None = None,
+        surfaces: Sequence[OptionSurfaceSnapshot | None] | None = None,
     ) -> list[ModelPrediction]:
-        """Features [B, A, L, F] (+ optional futures [B, T, F] / regimes) -> one prediction per row.
+        """Features [B, A, L, F] (+ optional futures [B, T, F] / regimes / option surfaces) ->
+        one prediction per row.
 
         futures: [B, T, FUTURES_FEATURE_DIM] — per-row futures microstructure windows.
         """
@@ -151,6 +189,8 @@ class ForecasterPredictor:
             raise ValueError("futures batch size must match features batch size")
         if barrier_contexts is not None and len(barrier_contexts) != features.shape[0]:
             raise ValueError("barrier_contexts length must match the batch size")
+        if surfaces is not None and len(surfaces) != features.shape[0]:
+            raise ValueError("surfaces length must match the batch size")
         regime_tensor = None
         if regimes is not None:
             if len(regimes) != features.shape[0]:
@@ -162,7 +202,8 @@ class ForecasterPredictor:
             if self._use_barrier_geometry
             else None
         )
-        out = self._model(features.to(self._device), fut, regime_tensor, barrier_tensor)
+        surface_tensor = _batch_surface_tensors(surfaces, self._device) if surfaces is not None else None
+        out = self._model(features.to(self._device), fut, regime_tensor, barrier_tensor, surface=surface_tensor)
         rq = out["return_quantiles"].cpu()                              # [B, Q]
         vol = out["volatility"].reshape(-1).cpu()                       # [B]
         mae_pred = out["mae"].reshape(-1).cpu()                         # [B]
@@ -171,10 +212,13 @@ class ForecasterPredictor:
         unc = out["uncertainty"].reshape(-1).cpu()                      # [B]
         ood = out["ood_score"].reshape(-1).cpu()                        # [B]
         regime_probs_t = F.softmax(out["regime_logits"], dim=-1).cpu() # [B, R]
+        primary_side_t = out["primary_side"].reshape(-1).cpu()          # [B] in {-1,0,1}
+        meta_prob_t = torch.sigmoid(out["meta_label_logit"]).reshape(-1).cpu()  # [B]
         return [
             self._to_prediction(
                 rq[i], float(vol[i]), float(mae_pred[i]), float(mfe_pred[i]), barrier[i], float(unc[i]), float(ood[i]), regime_probs_t[i],
-                symbol, timestamps[i], barrier_contexts[i] if barrier_contexts is not None else None
+                symbol, timestamps[i], barrier_contexts[i] if barrier_contexts is not None else None,
+                int(primary_side_t[i]), float(meta_prob_t[i]),
             )
             for i in range(features.shape[0])
         ]
@@ -187,11 +231,14 @@ class ForecasterPredictor:
         futures: Tensor | None = None,
         regime: RegimeInput | None = None,
         barrier_context: BarrierContext | None = None,
+        surface: OptionSurfaceSnapshot | None = None,
     ) -> ModelPrediction:
-        """Features [A, L, F] (+ optional futures [T, F] / regime) -> one ModelPrediction."""
+        """Features [A, L, F] (+ optional futures [T, F] / regime / option surface) ->
+        one ModelPrediction."""
         fut_batch = futures.unsqueeze(0) if futures is not None else None
         regimes = [regime] if regime is not None else None
         barrier_contexts = [barrier_context] if barrier_context is not None else None
+        surfaces = [surface] if surface is not None else None
         return self.predict_batch(
             features.unsqueeze(0),
             symbol,
@@ -199,6 +246,7 @@ class ForecasterPredictor:
             fut_batch,
             regimes,
             barrier_contexts,
+            surfaces,
         )[0]
 
     def _to_prediction(
@@ -214,6 +262,8 @@ class ForecasterPredictor:
         symbol: str,
         ts: datetime,
         barrier_context: BarrierContext | None,
+        primary_side: int = 0,
+        meta_label_prob: float | None = None,
     ) -> ModelPrediction:
         quant = {lvl: float(rq[k]) for k, lvl in enumerate(self._quantiles)}
         hp = _build_horizon_prediction(quant, vol, self._horizon_bars)
@@ -232,6 +282,8 @@ class ForecasterPredictor:
             barrier=bp, mae=mae, mfe=float(max(mfe_pred, 0.0)), sigma_H=sigma_H,
             stop_return=barrier_context.stop_return if barrier_context is not None else None,
             target_return=barrier_context.target_return if barrier_context is not None else None,
+            primary_side=primary_side,
+            meta_label_prob=meta_label_prob if primary_side != 0 else None,
             epistemic=0.0,
             aleatoric=aleatoric,
             ood_score=ood,
@@ -312,8 +364,10 @@ class WorldModelPredictor:
         regime: RegimeInput | None = None,
         barrier_context: BarrierContext | None = None,
         n_samples: int | None = None,
+        surface: OptionSurfaceSnapshot | None = None,
     ) -> ModelPrediction:
-        """Features [A, L, F] (+ optional futures [T, F] / regime) -> a multi-horizon ModelPrediction."""
+        """Features [A, L, F] (+ optional futures [T, F] / regime / option surface) -> a
+        multi-horizon ModelPrediction."""
         if self._persist_state and self._last_ts is not None and ts.date() != self._last_ts.date():
             self._state = None  # new trading day: don't carry belief across the overnight gap
         reg = _batch_regime_tensor([regime], self._device) if regime is not None else None
@@ -321,6 +375,7 @@ class WorldModelPredictor:
         barrier_tensor = None
         if self._use_barrier_geometry and barrier_context is not None:
             barrier_tensor = _batch_barrier_context_tensor([barrier_context], self._device)
+        surface_tensor = _batch_surface_tensors([surface], self._device) if surface is not None else None
         out = self._model(
             features.unsqueeze(0).to(self._device),
             fut,
@@ -328,6 +383,7 @@ class WorldModelPredictor:
             barrier_tensor,
             n_samples=n_samples,
             state=self._state if self._persist_state else None,
+            surface=surface_tensor,
             deterministic=self._deterministic,
         )
         if self._persist_state:

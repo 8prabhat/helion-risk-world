@@ -80,6 +80,13 @@ def loss_weights_from_mapping(cfg: Mapping[str, Any] | None) -> LossWeights:
         uncertainty=float(weights_cfg.get("uncertainty", _LOSS_DEFAULTS.uncertainty)),
         ood=float(weights_cfg.get("ood", _LOSS_DEFAULTS.ood)),
         barrier_class_weights=_barrier_class_weights_from_mapping(weights_cfg),
+        repr_var=float(weights_cfg.get("repr_var", _LOSS_DEFAULTS.repr_var)),
+        repr_cov=float(weights_cfg.get("repr_cov", _LOSS_DEFAULTS.repr_cov)),
+        barrier_touch=float(weights_cfg.get("barrier_touch", _LOSS_DEFAULTS.barrier_touch)),
+        barrier_direction=float(
+            weights_cfg.get("barrier_direction", _LOSS_DEFAULTS.barrier_direction)
+        ),
+        meta_label=float(weights_cfg.get("meta_label", _LOSS_DEFAULTS.meta_label)),
     )
 
 

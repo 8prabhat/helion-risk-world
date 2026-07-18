@@ -230,6 +230,11 @@ def _build_steps_from_source(
                 execution_market=_market(trade_symbol, fill_ts, float(opens[i + 1])),
                 realized_return=realized,
                 label_realized_at=timestamps[i + horizon],
+                # Per-bar settlement legs (settlement-bug fix, 2026-07-18 — see
+                # BacktestStep.fill_to_mark_return): carried positions mark
+                # close[i] → open[i+1], post-fill positions mark open[i+1] → close[i+1].
+                carry_return=float(opens[i + 1] / closes[i] - 1.0),
+                fill_to_mark_return=float(closes[i + 1] / opens[i + 1] - 1.0),
             )
         )
     return steps
@@ -335,6 +340,11 @@ def _build_model_steps_from_source(
                 execution_market=_market(trade_symbol, fill_ts, float(opens[i + 1])),
                 realized_return=realized,
                 label_realized_at=timestamps[i + horizon],
+                # Per-bar settlement legs (settlement-bug fix, 2026-07-18 — see
+                # BacktestStep.fill_to_mark_return): carried positions mark
+                # close[i] → open[i+1], post-fill positions mark open[i+1] → close[i+1].
+                carry_return=float(opens[i + 1] / closes[i] - 1.0),
+                fill_to_mark_return=float(closes[i + 1] / opens[i + 1] - 1.0),
             )
         )
     return steps
@@ -424,6 +434,7 @@ def _build_real_steps(
     model_path: str | Path | None = None,
     *,
     persist_state: bool = True,
+    eval_split: str = "test",
 ) -> list[BacktestStep]:
     source = ParquetMarketDataSource(
         data_dir=data_dir,
@@ -439,7 +450,7 @@ def _build_real_steps(
             runtime=runtime,
             data_dir=data_dir,
         )
-        return _filter_steps_to_runtime_split(steps, runtime, split="test")
+        return _filter_steps_to_runtime_split(steps, runtime, split=eval_split)
     return _build_steps_from_source(dc, source, horizon, data_dir=data_dir)
 
 
@@ -472,6 +483,7 @@ def build_steps_for_run(dc, cfg: dict, args: object, horizon: int) -> tuple[list
             horizon,
             getattr(args, "model_path", None) if getattr(args, "model") else None,
             persist_state=persist_state,
+            eval_split=getattr(args, "eval_split", None) or "test",
         )
         return steps, predictor_kind
 

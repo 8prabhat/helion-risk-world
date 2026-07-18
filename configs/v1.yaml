@@ -77,6 +77,16 @@ loss:
     calibration: 0.4
     uncertainty: 0.2
     ood: 0.2
+    # Anti-collapse regularization on z (feature-onboarding follow-up, 2026-07-12): without
+    # this, supervised fine-tuning collapsed z from ~15 effective dimensions (right after
+    # Stage-2 pretraining) down to ~1, starving the regime/OOD/barrier-direction heads of the
+    # information they'd need -- confirmed directly (target-class barrier recall went from
+    # 0% to 11-30% once this was added). Tuned on a full retrain grid: 0.05 was too weak
+    # (0% target recall, same as no regularization); 0.1 is the minimum strength that reliably
+    # works; 0.3 traded more macro_f1 for better calibration. See
+    # src/helion_risk_world/config/model_config.py's LossWeights docstring for the full grid.
+    repr_var: 0.1
+    repr_cov: 0.005
 
 planner:
   sizes: [0.0, 0.1, 0.25, 0.5, 1.0]

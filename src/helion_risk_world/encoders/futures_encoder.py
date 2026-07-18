@@ -102,14 +102,14 @@ def build_futures_feature_tensor(
     training, backtest, and paper trading (DRY, SPEC.md §12).
 
     ``oi_available`` (review Idea #5): 1.0 where OI is a real observed value,
-    0.0 where it's missing/NaN — see data/futures_window_builder.py::_oi_availability
-    for the canonical (currently the only actually-used) implementation of this
-    feature layout; kept in sync here since this builder is DRY's single
-    definition even though no caller currently exercises it.
+    0.0 where it's missing/NaN — see alpha_data's ``pipelines/futures_microstructure.py``
+    (Phase 2 migration) for the canonical (currently the only actually-used)
+    implementation of this feature layout; kept in sync here since this builder is
+    DRY's single definition even though no caller currently exercises it.
 
     ``oi_basis_interaction`` (feature/label overhaul Phase 2): d_oi * sign(basis
-    change) — see data/futures_window_builder.py::_oi_basis_interaction, same
-    kept-in-sync-but-unused status as oi_available above.
+    change) — see ``quanthelion.data.transforms.primitives.oi_basis_interaction``,
+    same kept-in-sync-but-unused status as oi_available above.
     """
     scalars = [basis, oi, d_oi, volume_zscore, calendar_spread, dte_norm, roll_flag, d_oi_mag,
                oi_available, oi_basis_interaction]

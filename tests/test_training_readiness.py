@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-
 import pandas as pd
 import pytest
 
@@ -12,11 +10,8 @@ torch = pytest.importorskip("torch")
 from helion_risk_world.config.model_config import ModelConfig
 from helion_risk_world.config.training_config import TrainingConfig
 from helion_risk_world.config.execution_config import CostModelConfig
-from helion_risk_world.labeling.barrier_labeler import BarrierLabeler
-from helion_risk_world.labeling.uniqueness import compute_uniqueness
 from helion_risk_world.losses.composite_loss import ForecasterLoss
 from helion_risk_world.model import HRWForecaster
-from helion_risk_world.schemas.label_schema import Barrier, LabelRecord
 from helion_risk_world.training.opportunity_weighting import (
     compute_management_opportunity_weights,
 )
@@ -24,85 +19,17 @@ from helion_risk_world.training.trainer import ForecastBatch, HRWTrainer
 from helion_risk_world.training import trainer as trainer_module
 from helion_risk_world.training.train_heads import HeadTrainer
 
-
-def test_barrier_labeler_drops_tail_without_full_horizon() -> None:
-    ts0 = datetime(2026, 1, 1, 9, 15)
-    timestamps = [ts0 + timedelta(minutes=5 * i) for i in range(8)]
-    close = [100.0, 101.0, 100.5, 100.2, 100.4, 100.7, 100.9, 101.0]
-
-    records = BarrierLabeler(H=3, add_uniqueness=False).label(timestamps, close)
-
-    assert len(records) == len(close) - 3
-    assert records[-1].ts == timestamps[4]
-    assert all(1 <= record.exit_t <= 3 for record in records)
-
-
-def test_barrier_labeler_uses_next_bar_as_entry() -> None:
-    ts0 = datetime(2026, 1, 1, 9, 15)
-    timestamps = [ts0 + timedelta(minutes=5 * i) for i in range(5)]
-    close = [100.0, 110.0, 111.0, 112.0, 113.0]
-
-    record = BarrierLabeler(H=2, u=100.0, d=100.0, add_uniqueness=False).label(timestamps, close)[0]
-
-    assert record.ts == timestamps[0]
-    assert record.exit_return == pytest.approx((111.0 / 110.0) - 1.0, abs=1e-6)
-
-
-def test_barrier_labeler_marks_same_bar_dual_touch_as_ambiguous() -> None:
-    ts0 = datetime(2026, 1, 1, 9, 15)
-    timestamps = [ts0 + timedelta(minutes=5 * i) for i in range(5)]
-    close = [100.0, 100.0, 100.0, 100.0, 100.0]
-    open_prices = [100.0, 100.0, 100.0, 100.0, 100.0]
-    high_prices = [100.0, 101.0, 100.5, 100.5, 100.5]
-    low_prices = [100.0, 99.0, 99.5, 99.5, 99.5]
-
-    record = BarrierLabeler(H=2, u=0.1, d=0.1, add_uniqueness=False).label(
-        timestamps,
-        close,
-        open_prices=open_prices,
-        high_prices=high_prices,
-        low_prices=low_prices,
-    )[0]
-
-    assert record.barrier is Barrier.AMBIGUOUS
-    assert record.barrier_valid is False
-    assert record.entry_price == pytest.approx(100.0, abs=1e-6)
-    assert record.exit_price == pytest.approx(100.0, abs=1e-6)
-
-
-def test_uniqueness_uses_record_position_as_start_index() -> None:
-    ts0 = datetime(2026, 1, 1, 9, 15)
-    records = [
-        LabelRecord(
-            symbol="X",
-            ts=ts0,
-            label_realized_at=ts0 + timedelta(minutes=5),
-            horizon_bars=3,
-            barrier=Barrier.TARGET,
-            exit_return=0.01,
-            exit_t=1,
-            realized_vol=0.01,
-            mae=0.0,
-            mfe=0.01,
-        ),
-        LabelRecord(
-            symbol="X",
-            ts=ts0 + timedelta(minutes=5),
-            label_realized_at=ts0 + timedelta(minutes=10),
-            horizon_bars=3,
-            barrier=Barrier.TIMEOUT,
-            exit_return=0.0,
-            exit_t=2,
-            realized_vol=0.01,
-            mae=0.0,
-            mfe=0.0,
-        ),
-    ]
-
-    weights = compute_uniqueness(records)
-
-    assert weights[0] == pytest.approx(0.75, abs=1e-6)
-    assert weights[1] == pytest.approx(5.0 / 6.0, abs=1e-6)
+# NOTE (Phase 2 migration): the BarrierLabeler/compute_uniqueness regression tests
+# formerly here (drops-tail-without-full-horizon, next-bar-entry, ambiguous-same-bar
+# dual-touch, uniqueness-position-as-start-index) were removed along with
+# labeling/barrier_labeler.py and labeling/uniqueness.py. Their scenarios are now
+# covered against the replacement engine directly: entry-offset/next-bar-open and
+# ambiguous-tie handling in quanthelion's tests/unit/test_p2_labels_and_executor.py
+# (TestTripleBarrier's entry_offset tests), and the full ambiguous/cost-floor/gap/
+# session-boundary adapter behavior in this repo's tests/test_alpha_labels.py. AFML
+# uniqueness weighting itself was superseded (not ported) by alpha_data's
+# combined_sample_weights (uniqueness x return-attribution x time-decay) -- an
+# accepted, deliberate upgrade, so there's no equivalent formula to regression-test.
 
 
 def test_forecaster_loss_respects_sample_weights() -> None:

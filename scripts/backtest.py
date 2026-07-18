@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -222,6 +223,9 @@ def main() -> None:
             "walk_forward",
             "calibration_gate",
             "persist_state",
+            "stop_target_mode",
+            "risk_aversion_lambda",
+            "eval_split",
         ),
     )
     if not args.demo and not args.real:
@@ -249,6 +253,20 @@ def main() -> None:
         else (strategy_profile_from_cfg(cfg, args.strategy).name.value,)
     )
     strategies = [get_strategy_profile(name) for name in strategy_names]
+    if args.stop_target_mode != "barrier_context" or args.risk_aversion_lambda is not None:
+        # Override each profile's frozen planner_config fields (2026-07-16 quantile-
+        # sizing + risk-aversion-lambda sweep diagnostics) -- both StrategyProfile and
+        # PlannerConfig are frozen dataclasses, so a modified copy via dataclasses.replace
+        # is required rather than in-place mutation.
+        planner_overrides: dict[str, Any] = {}
+        if args.stop_target_mode != "barrier_context":
+            planner_overrides["stop_target_mode"] = args.stop_target_mode
+        if args.risk_aversion_lambda is not None:
+            planner_overrides["risk_aversion_lambda"] = args.risk_aversion_lambda
+        strategies = [
+            replace(s, planner_config=replace(s.planner_config, **planner_overrides))
+            for s in strategies
+        ]
     cases: list[StrategyBacktestCase] = []
     predictor_kinds: dict[str, str] = {}
     leakage_reports: dict[str, dict[str, object]] = {}

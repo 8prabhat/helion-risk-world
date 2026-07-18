@@ -13,10 +13,19 @@ import pandas as pd
 
 from helion_risk_world.config.data_config import DataConfig
 from helion_risk_world.barrier_context import BarrierContext
+from helion_risk_world.data.alpha_features import AlphaDataMarketWindowBuilder
+from helion_risk_world.data.alpha_futures_features import AlphaDataFuturesWindowBuilder
+from helion_risk_world.data.alpha_option_chain import (
+    AlphaDataAtmGreeksLoader,
+    AlphaDataOptionChainSource,
+    AlphaDataSurfaceStatsLoader,
+    CompositeMarketDataSource,
+)
+from helion_risk_world.data.alpha_regime_context import AlphaDataMacroContextLoader
 from helion_risk_world.data.feature_builder import FeatureBuilder, MarketBatch, MarketDataSource
-from helion_risk_world.data.futures_window_builder import FuturesWindowBuilder
 from helion_risk_world.data.market_window_builder import CANDLE_FEATURE_NAMES
-from helion_risk_world.data.regime_context_builder import RegimeContextBuilder
+from helion_risk_world.data.option_surface_builder import OptionSurfaceBuilder
+from helion_risk_world.data.regime_context_builder import RegimeContextBuilder, _VixLoader
 from helion_risk_world.schemas.market_schema import EventContext, RegimeContext
 
 RegimeInput = tuple[RegimeContext, EventContext]
@@ -157,37 +166,55 @@ class ModelInputBuilder:
         data_dir: str | Path | None,
         contract: ModelInputContract,
     ) -> ModelInputBuilder:
+        """Build from alpha_data's precomputed features (Phase 2 migration -- see
+        alpha_data/docs/DATA_CATALOG.md). ``data_dir``/local assembled-parquet paths
+        are no longer read; every builder here sources from the shared alpha_data lake
+        instead of this repo's own local computation.
+        """
         contract.assert_compatible(cfg)
 
-        root = Path(data_dir) if data_dir is not None else None
         futures_builder = None
         if contract.uses_futures:
-            if root is None:
-                raise ValueError("artifact expects futures inputs but no data_dir was provided")
-            futures_path = root / "processed" / "banknifty_5min.parquet"
-            if not futures_path.exists():
-                raise FileNotFoundError(
-                    f"artifact expects futures inputs, but {futures_path} is missing"
-                )
-            futures_builder = FuturesWindowBuilder.from_parquet(str(futures_path))
+            futures_builder = AlphaDataFuturesWindowBuilder(cfg.universe[0], interval=cfg.base_interval)
 
         regime_builder = None
         if contract.uses_regime_context:
-            vix_path = root / "ohlcv" / "INDIAVIX_5min.parquet" if root is not None else None
-            if contract.require_vix and (vix_path is None or not vix_path.exists()):
-                raise FileNotFoundError("artifact expects INDIAVIX regime data, but it is missing")
             if contract.require_daily_context:
                 raise ValueError(
                     "artifact requires non-Upstox daily_context regime data; retrain with "
                     "Upstox-only regime inputs"
                 )
-            regime_builder = RegimeContextBuilder.from_paths(
-                vix_path=vix_path if vix_path is not None and vix_path.exists() else None,
-                daily_context_path=None,
+            root = Path(data_dir) if data_dir is not None else None
+            vix_path = root / "ohlcv" / f"INDIAVIX_{cfg.base_interval}.parquet" if root is not None else None
+            if contract.require_vix and (vix_path is None or not vix_path.exists()):
+                raise FileNotFoundError("artifact expects INDIAVIX regime data, but it is missing")
+            vix_loader = (
+                _VixLoader.from_parquet(vix_path) if vix_path is not None and vix_path.exists() else None
+            )
+            regime_builder = RegimeContextBuilder(
+                vix_loader=vix_loader,
+                daily_ctx=AlphaDataMacroContextLoader(cfg.universe[0], interval=cfg.base_interval),
                 symbol=cfg.universe[0],
+                allow_non_upstox_context=True,
             )
 
-        feature_builder = FeatureBuilder(cfg, source, futures_builder=futures_builder)
+        surface_builder = None
+        if contract.uses_option_surface:
+            source = CompositeMarketDataSource(
+                source, AlphaDataOptionChainSource(interval=cfg.base_interval),
+            )
+            surface_builder = OptionSurfaceBuilder(
+                n_strikes=cfg.n_strikes,
+                stats_source=AlphaDataSurfaceStatsLoader(interval=cfg.base_interval),
+                atm_greeks_source=AlphaDataAtmGreeksLoader(interval=cfg.base_interval),
+            )
+
+        feature_builder = FeatureBuilder(
+            cfg, source,
+            window_builder=AlphaDataMarketWindowBuilder(interval=cfg.base_interval),
+            surface_builder=surface_builder,
+            futures_builder=futures_builder,
+        )
         return cls(
             contract=contract,
             feature_builder=feature_builder,

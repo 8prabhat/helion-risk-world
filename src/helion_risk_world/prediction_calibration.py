@@ -7,6 +7,7 @@ and applied consistently in predict/backtest/paper-trading flows.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -19,6 +20,19 @@ from helion_risk_world.schemas.prediction_schema import (
 )
 
 _EPS = 1e-9
+
+# Safeguards for temperature fitting (2026-07-13): the original grid search picked whatever
+# temperature minimized loss on the SAME sample it was evaluated against -- pure in-sample
+# optimization. Confirmed empirically to overfit: a fitted barrier_temperature=3.76 from ~2588
+# validation samples made held-out test barrier_ece WORSE (0.040 -> 0.114) than no correction
+# at all (T=1.0), on the identical underlying model. These constants gate a chronological
+# fit/check split (see `_fit_temperature_with_holdout`) so a temperature is only ever applied
+# if it demonstrably generalizes to samples it wasn't fit on.
+_MIN_TEMPERATURE_FIT_SAMPLES = 200  # below this, don't trust any split-based fit at all
+_TEMPERATURE_HOLDOUT_FRACTION = 0.4
+_TEMPERATURE_SHRINKAGE = 0.5  # even a holdout-validated temperature is a noisy point estimate
+# from a few-hundred/thousand-sample split; partially shrinking back to 1.0 is a cheap extra
+# safeguard against a holdout split that happened to validate a fluke.
 
 
 @dataclass(frozen=True)
@@ -86,6 +100,21 @@ class PredictionCalibration:
     horizons: dict[int, HorizonPredictionCalibration]
     barrier_temperature: float = 1.0
     regime_temperature: float = 1.0
+    barrier_prior_offsets: tuple[float, float, float] | None = None
+    """Per-class log-prior correction for barrier probabilities (2026-07-18).
+
+    Training uses class-weighted cross-entropy (``LossWeights.barrier_class_weights``,
+    auto-computed from the label distribution) to prevent majority-class collapse. That
+    upweighting systematically inflates minority-class predicted probabilities relative
+    to their true base rates — a PRIOR SHIFT, which temperature scaling structurally
+    cannot fix (temperature only sharpens/flattens toward uniform; it has no per-class
+    direction). Diagnosed empirically 2026-07-11: mean predicted P(target)=27% against a
+    0.9% true base rate, and the crude divide-by-class-weight correction cut Brier 37%.
+    This field is the properly-fit version of that correction: additive per-class
+    offsets in logit space, fit on a chronological split with the same
+    holdout-validation + shrinkage safeguards as the temperature (see
+    ``_fit_barrier_prior_offsets``). Applied BEFORE temperature. ``None`` = no
+    correction (not validated to generalize, or never fit)."""
     source: str = "unknown"
     sample_count: int = 0
 
@@ -100,7 +129,10 @@ class PredictionCalibration:
             if horizon_pred.horizon_bars == original_management.horizon_bars:
                 management = updated
 
-        barrier = _apply_barrier_temperature(prediction.barrier, self.barrier_temperature)
+        barrier = _apply_barrier_temperature(
+            _apply_barrier_prior_offsets(prediction.barrier, self.barrier_prior_offsets),
+            self.barrier_temperature,
+        )
         regime_probs = _apply_probability_temperature(prediction.regime_probs, self.regime_temperature)
         aleatoric_scale = _interval_width(management) / max(_interval_width(original_management), _EPS)
         mae = max(float(prediction.mae) * aleatoric_scale, 0.0)
@@ -118,13 +150,26 @@ class PredictionCalibration:
             stop_return=prediction.stop_return,
             target_return=prediction.target_return,
             regime_probs=regime_probs,
+            # Meta-labeling fields (2026-07-18): not recalibrated (no fitted correction for
+            # them yet), but must be carried through unchanged -- same "don't silently drop
+            # a field on rebuild" bug class the epistemic_calibrated fix below addresses.
+            primary_side=int(prediction.primary_side),
+            meta_label_prob=(
+                float(prediction.meta_label_prob)
+                if prediction.meta_label_prob is not None
+                else None
+            ),
             epistemic=float(prediction.epistemic),
             aleatoric=aleatoric,
             ood_score=float(prediction.ood_score),
+            # Preserve the placeholder flag (2026-07-18 fix): omitting this field
+            # defaulted it back to True, silently re-marking ForecasterPredictor's
+            # hardcoded epistemic=0.0 as "calibrated" after calibration was applied.
+            epistemic_calibrated=bool(prediction.epistemic_calibrated),
         )
 
     def to_metadata(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "version": 1,
             "source": self.source,
             "sample_count": int(self.sample_count),
@@ -136,12 +181,21 @@ class PredictionCalibration:
                 for horizon, calibration in sorted(self.horizons.items())
             },
         }
+        if self.barrier_prior_offsets is not None:
+            payload["barrier_prior_offsets"] = [float(v) for v in self.barrier_prior_offsets]
+        return payload
 
     @classmethod
     def from_metadata(cls, payload: Mapping[str, object] | None) -> "PredictionCalibration | None":
         if payload is None:
             return None
         horizon_payloads = dict(payload.get("horizons", {}))
+        raw_offsets = payload.get("barrier_prior_offsets")
+        prior_offsets: tuple[float, float, float] | None = None
+        if raw_offsets is not None:
+            values = [float(v) for v in raw_offsets]  # type: ignore[union-attr]
+            if len(values) == 3:
+                prior_offsets = (values[0], values[1], values[2])
         return cls(
             quantile_levels=tuple(float(level) for level in payload.get("quantile_levels", ())),
             horizons={
@@ -152,6 +206,7 @@ class PredictionCalibration:
             },
             barrier_temperature=float(payload.get("barrier_temperature", 1.0)),
             regime_temperature=float(payload.get("regime_temperature", 1.0)),
+            barrier_prior_offsets=prior_offsets,
             source=str(payload.get("source", "unknown")),
             sample_count=int(payload.get("sample_count", 0)),
         )
@@ -196,13 +251,23 @@ def fit_prediction_calibration(
     if not calibrated_horizons:
         return None
 
-    barrier_temperature = _fit_barrier_temperature(barrier_probs, barrier_labels)
+    # Fit the per-class prior correction FIRST (it targets the class-weight-induced
+    # prior shift temperature cannot express), then fit the temperature on the
+    # prior-corrected probabilities so the two compose the same way apply() applies them.
+    barrier_prior_offsets = _fit_barrier_prior_offsets(barrier_probs, barrier_labels)
+    temperature_input_probs = barrier_probs
+    if barrier_prior_offsets is not None and barrier_probs is not None:
+        temperature_input_probs = _apply_prior_offsets_array(
+            np.asarray(barrier_probs, dtype=float), np.asarray(barrier_prior_offsets)
+        )
+    barrier_temperature = _fit_barrier_temperature(temperature_input_probs, barrier_labels)
     regime_temperature = _fit_temperature(regime_probs, regime_labels)
     return PredictionCalibration(
         quantile_levels=levels,
         horizons=calibrated_horizons,
         barrier_temperature=barrier_temperature,
         regime_temperature=regime_temperature,
+        barrier_prior_offsets=barrier_prior_offsets,
         source=source,
         sample_count=sample_count,
     )
@@ -280,50 +345,135 @@ def _fit_volatility_affine(
     return scale, bias
 
 
+def _apply_prior_offsets_array(probs: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    """Apply additive log-space per-class offsets to a [N, C] probability array."""
+    logits = np.log(np.clip(probs, _EPS, 1.0)) + offsets.reshape(1, -1)
+    logits = logits - logits.max(axis=1, keepdims=True)
+    weights = np.exp(logits)
+    return weights / weights.sum(axis=1, keepdims=True).clip(min=_EPS)
+
+
+_PRIOR_OFFSET_CLIP = 3.0  # |log prior ratio| cap: a >20x prior correction is more likely
+# a degenerate split (a class absent from the fit window) than a real, stable shift.
+
+
+def _fit_barrier_prior_offsets(
+    probs: Sequence[Sequence[float]] | None,
+    labels: Sequence[int] | None,
+) -> tuple[float, float, float] | None:
+    """Fit per-class log-prior offsets correcting the class-weighted-CE prior shift.
+
+    Analytic fit on the chronological FIT split: ``offset_c = log(freq_c / mean_pred_c)``
+    (the standard prior-correction for a model trained under class reweighting), clipped
+    and mean-centered (softmax is shift-invariant, centering keeps magnitudes honest).
+    Accepted only if it improves Brier+ECE on the held-out CHECK split it wasn't fit on,
+    then shrunk halfway toward zero — the exact same safeguard pattern
+    ``_fit_temperature_with_holdout`` uses, and for the same empirically-confirmed
+    reason (in-sample calibration fits on this data overfit).
+    """
+    if probs is None or labels is None:
+        return None
+    prob_array = np.asarray(probs, dtype=float)
+    label_array = np.asarray(labels, dtype=int).reshape(-1)
+    n = prob_array.shape[0]
+    if prob_array.ndim != 2 or prob_array.shape[1] != 3 or n == 0 or n != label_array.shape[0]:
+        return None
+    if n < _MIN_TEMPERATURE_FIT_SAMPLES:
+        return None
+
+    split = int(round(n * (1.0 - _TEMPERATURE_HOLDOUT_FRACTION)))
+    split = max(1, min(n - 1, split))
+    fit_probs, fit_labels = prob_array[:split], label_array[:split]
+    check_probs, check_labels = prob_array[split:], label_array[split:]
+
+    n_classes = prob_array.shape[1]
+    freq = np.bincount(fit_labels, minlength=n_classes).astype(float)
+    if np.any(freq == 0):
+        return None  # a class absent from the fit window: any offset for it is a guess
+    freq = freq / freq.sum()
+    mean_pred = fit_probs.mean(axis=0).clip(min=_EPS)
+    offsets = np.clip(np.log(freq / mean_pred), -_PRIOR_OFFSET_CLIP, _PRIOR_OFFSET_CLIP)
+    offsets = offsets - offsets.mean()
+
+    def _score(p: np.ndarray, y: np.ndarray) -> float:
+        metrics = _classification_calibration_metrics(p, y)
+        return metrics["brier"] + metrics["ece"]
+
+    baseline_check = _score(check_probs, check_labels)
+    candidate_check = _score(
+        _apply_prior_offsets_array(check_probs, offsets), check_labels
+    )
+    if candidate_check >= baseline_check - 1e-12:
+        return None  # didn't generalize to held-out data — reject, same as temperature
+
+    shrunk = _TEMPERATURE_SHRINKAGE * offsets
+    return (float(shrunk[0]), float(shrunk[1]), float(shrunk[2]))
+
+
 def _fit_temperature(
     probs: Sequence[Sequence[float]] | None,
     labels: Sequence[int] | None,
 ) -> float:
-    if probs is None or labels is None:
-        return 1.0
-    prob_array = np.asarray(probs, dtype=float)
-    label_array = np.asarray(labels, dtype=int).reshape(-1)
-    if prob_array.ndim != 2 or prob_array.shape[0] == 0 or prob_array.shape[0] != label_array.shape[0]:
-        return 1.0
-    temps = np.geomspace(0.35, 4.0, 41)
-    losses = [
-        _nll_loss(_apply_temperature(prob_array, float(temp)), label_array)
-        for temp in temps
-    ]
-    return float(temps[int(np.argmin(np.asarray(losses, dtype=float)))])
+    return _fit_temperature_with_holdout(probs, labels, loss_fn=_nll_loss)
 
 
 def _fit_barrier_temperature(
     probs: Sequence[Sequence[float]] | None,
     labels: Sequence[int] | None,
 ) -> float:
+    def _brier_plus_ece(p: np.ndarray, y: np.ndarray) -> float:
+        metrics = _classification_calibration_metrics(p, y)
+        return metrics["brier"] + metrics["ece"]
+
+    return _fit_temperature_with_holdout(probs, labels, loss_fn=_brier_plus_ece)
+
+
+def _fit_temperature_with_holdout(
+    probs: Sequence[Sequence[float]] | None,
+    labels: Sequence[int] | None,
+    *,
+    loss_fn: Callable[[np.ndarray, np.ndarray], float],
+) -> float:
+    """Grid-search a temperature on a chronological FIT split, only accept it if it also
+    improves (not just doesn't-get-worse) on a held-out CHECK split it wasn't fit on, then
+    shrink halfway back to 1.0 as a further safeguard -- see the module-level constants'
+    docstring for why (a pure in-sample fit was confirmed to overfit on real data).
+
+    ``probs``/``labels`` are assumed already in their natural (typically chronological)
+    collection order, e.g. from a per-timestamp validation loop -- the fit/check split is a
+    plain prefix/suffix split, not a shuffle, so the check split is never "from the past"
+    relative to what the temperature was fit on.
+    """
     if probs is None or labels is None:
         return 1.0
     prob_array = np.asarray(probs, dtype=float)
     label_array = np.asarray(labels, dtype=int).reshape(-1)
-    if prob_array.ndim != 2 or prob_array.shape[0] == 0 or prob_array.shape[0] != label_array.shape[0]:
+    n = prob_array.shape[0]
+    if prob_array.ndim != 2 or n == 0 or n != label_array.shape[0]:
+        return 1.0
+    if n < _MIN_TEMPERATURE_FIT_SAMPLES:
         return 1.0
 
-    baseline = _classification_calibration_metrics(prob_array, label_array)
-    best_temp = 1.0
-    best_score = baseline["brier"] + baseline["ece"]
+    split = int(round(n * (1.0 - _TEMPERATURE_HOLDOUT_FRACTION)))
+    split = max(1, min(n - 1, split))
+    fit_probs, fit_labels = prob_array[:split], label_array[:split]
+    check_probs, check_labels = prob_array[split:], label_array[split:]
+
+    baseline_fit = loss_fn(fit_probs, fit_labels)
+    best_temp, best_score = 1.0, baseline_fit
     for temp in np.geomspace(0.35, 4.0, 41):
-        scaled = _apply_temperature(prob_array, float(temp))
-        metrics = _classification_calibration_metrics(scaled, label_array)
-        if (
-            metrics["brier"] <= baseline["brier"] + 1e-12
-            and metrics["ece"] <= baseline["ece"] + 1e-12
-        ):
-            score = metrics["brier"] + metrics["ece"]
-            if score < best_score - 1e-12:
-                best_temp = float(temp)
-                best_score = score
-    return best_temp
+        score = loss_fn(_apply_temperature(fit_probs, float(temp)), fit_labels)
+        if score < best_score - 1e-12:
+            best_temp, best_score = float(temp), score
+    if best_temp == 1.0:
+        return 1.0
+
+    baseline_check = loss_fn(check_probs, check_labels)
+    candidate_check = loss_fn(_apply_temperature(check_probs, best_temp), check_labels)
+    if candidate_check >= baseline_check - 1e-12:
+        return 1.0  # didn't generalize to held-out data it wasn't fit on -- reject
+
+    return float(1.0 + _TEMPERATURE_SHRINKAGE * (best_temp - 1.0))
 
 
 def _nll_loss(probs: np.ndarray, labels: np.ndarray) -> float:
@@ -356,6 +506,23 @@ def _apply_temperature(probs: np.ndarray, temperature: float) -> np.ndarray:
     logits = logits - logits.max(axis=1, keepdims=True)
     weights = np.exp(logits)
     return weights / weights.sum(axis=1, keepdims=True).clip(min=_EPS)
+
+
+def _apply_barrier_prior_offsets(
+    barrier: BarrierProbabilities,
+    offsets: tuple[float, float, float] | None,
+) -> BarrierProbabilities:
+    if offsets is None:
+        return barrier
+    corrected = _apply_prior_offsets_array(
+        np.asarray([[barrier.stop, barrier.target, barrier.timeout]], dtype=float),
+        np.asarray(offsets, dtype=float),
+    )[0]
+    return BarrierProbabilities(
+        stop=float(corrected[0]),
+        target=float(corrected[1]),
+        timeout=float(corrected[2]),
+    )
 
 
 def _apply_barrier_temperature(
