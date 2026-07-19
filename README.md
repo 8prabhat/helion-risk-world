@@ -65,41 +65,46 @@ RAW DATA (market-plane only — no portfolio or account fields)
 
 ═══════════════════════════  MODEL FORWARD PASS  ═══════════════════════════
 
- CANDLE WINDOW [B, A, L, F]      FUTURES [B, T, 13]     REGIME CONTEXT [B, 20]
- A = assets  (universe size)     T = lookback            VIX, IV, expiry flags,
- L = lookback bars (96 default)  13 features per bar     FII/DII, event type
- F = 9 features per bar
-        │                               │                        │
-  TemporalEncoder             FuturesEncoder              RegimeEncoder
-  (per-asset GRU,             (1-D Conv × 2 →             (2-layer MLP)
-   mean-pool over assets)      global avg pool)
-        │                               │                        │
-   [B, d=128]                      [B, d=128]              [B, d=128]
-        │                               │                        │
-  CrossAssetEncoder                     │                        │
-  (multi-head self-attn                 │                        │
-   across assets → pool)               │                        │
-        │                               │                        │
-   [B, d=128]                          │                        │
-        └─────────────────┬────────────┘────────────────────────┘
+ CANDLE WINDOW [B, A, L, F]      FUTURES [B, T, 14]     REGIME CONTEXT [B, 22]     OPTION SURFACE
+ A = assets  (universe size)     T = lookback            VIX, IV, expiry flags,   [B, S, C] + [B, K]
+ L = lookback bars (96 default)  14 features per bar     FII/DII, event type      ATM±N strike grid
+ F = 30 features per bar                                                          + 12-wide context
+        │                               │                        │                     │
+  TemporalEncoder             FuturesEncoder              RegimeEncoder        OptionSurfaceEncoder
+  (per-asset GRU,             (1-D Conv × 2 →             (2-layer MLP)        (per-strike conv +
+   mean-pool over assets)      global avg pool)                                 context gate)
+        │                               │                        │                     │
+   [B, d=128]                      [B, d=128]              [B, d=128]              [B, d=128]
+        │                               │                        │                     │
+  CrossAssetEncoder                     │                        │                     │
+  (multi-head self-attn                 │                        │                     │
+   across assets → pool)               │                        │                     │
+        │                               │                        │                     │
+   [B, d=128]                          │                        │                     │
+        └─────────────────┬────────────┘────────────────────────┴─────────────────────┘
                           │
                   FusionEncoder (gated)
                   4-slot gate+candidate; zero-pads missing inputs
                           │
                      z_t [B, 128]
                           │
-    ┌──────────┬──────────┬────────────┬───────────┬────────────┐
-    │          │          │            │           │            │
-  Return    Volatility  Barrier    Uncertainty  Regime       OOD
-  Quantile  Head        Head       Head         Head         Head
-  Head      (softplus,  (3-class:  (epistemic + (6-class     (fitted post-
-  (5        strictly>0) stop/      aleatoric,   logits:      training on
-  monotone              target/    softplus>0)  trend/range/ train latents)
-  quantiles)            timeout)               event/hi-vol/
-                                               lo-vol/chop)
-    │          │          │            │           │            │
- [B, 5]      [B]       [B, 3]       [B, 2]      [B, 6]      [B, 1]
+    ┌──────────┬──────────┬────────────┬───────────┬────────────┬─────────────┐
+    │          │          │            │           │            │             │
+  Return    Volatility  Barrier    Uncertainty  Regime       OOD         Meta-Label
+  Quantile  Head        Head       Head         Head         Head        Head (2026-07-18)
+  Head      (softplus,  (3-class:  (epistemic + (6-class     (fitted post- (binary, cond. on
+  (5        strictly>0) stop/      aleatoric,   logits:      training on   momentum-based
+  monotone              target/    softplus>0)  trend/range/ train latents) primary_side;
+  quantiles)            timeout)               event/hi-vol/               "does this trade
+                                               lo-vol/chop)                clear cost")
+    │          │          │            │           │            │             │
+ [B, 5]      [B]       [B, 3]       [B, 2]      [B, 6]      [B, 1]         [B]
 ```
+
+Decomposed touch/direction heads (`TouchHead`/`DirectionHead`) and several auxiliary heads
+(`ExcursionHead`/`ExcursionBarrierHead`/`DrawdownHead`/`ExecutionCostHead`) also exist for
+experimental `barrier_mode`s and auxiliary supervision — omitted above for readability; see
+`heads/` in the repository layout below and `docs/architecture.md` for the full picture.
 
 ### Candle Features (F=30 per bar, `market_window_builder.py`)
 
@@ -187,6 +192,7 @@ event-type one-hot.
 | Epistemic + aleatoric uncertainty | `UncertaintyHead` | Heteroscedastic NLL |
 | Market regime (6-class heuristic from primitives.regime_label) | `RegimeHead` | Cross-entropy |
 | OOD score | `OODHead` | Fitted post-training (no gradient) |
+| Meta-label: is a trade in the primary side's direction worth it, net of cost (2026-07-18) | `MetaLabelHead` | Binary cross-entropy, NaN-masked where no side is proposed |
 
 ### World Model (RSSM) — Research Path
 
@@ -268,10 +274,15 @@ src/helion_risk_world/
   heads/
     return_head.py              Monotone quantile regression [B, Q]
     volatility_head.py          Realized vol (> 0)  [B]
-    barrier_head.py             3-class logits [B, 3]
+    barrier_head.py             3-class logits [B, 3] (legacy/derived barrier_mode)
+    touch_head.py / direction_head.py   Decomposed touch+direction (barrier_mode="decomposed")
+    excursion_head.py / excursion_barrier_head.py   MAE/MFE regression + derived-barrier proxy
+    meta_label_head.py          Binary "does a trade in primary_side's direction clear cost"
+                                [B] logit, conditioned on primary_side (2026-07-18)
     uncertainty_head.py         Epistemic + aleatoric [B, 2]
     regime_head.py              6-class logits [B, 6]
     ood_head.py                 OOD score fitted post-training [B, 1]
+    drawdown_head.py / execution_cost_head.py   Auxiliary research heads
   model.py                      HRWForecaster, HRWWorldModel
   inference.py                  ForecasterPredictor, WorldModelPredictor
   worlds/
@@ -281,25 +292,28 @@ src/helion_risk_world/
     portfolio_world.py          Portfolio-level consequence model
   losses/
     quantile_loss.py            Pinball loss (device-safe)
-    composite_loss.py           ForecasterLoss: weighted sum
+    composite_loss.py           ForecasterLoss: weighted sum (incl. masked meta-label BCE)
     rssm_loss.py                L_dyn + L_imag (Dreamer v2 KL balancing + free-bits)
   evaluation/
     calibration_metrics.py      compute() + CalibrationGate (PASS/FAIL)
     world_model_metrics.py      rollout MAE/RMSE + KL collapse + prior coverage
   labeling/
-    barrier_labeler.py          BarrierLabeler (EWMA vol scaling + LabelRecord)
-    uniqueness.py               apply_uniqueness_weights()
+    meta_labels.py              primary_side_from_close + meta_label_for_side (2026-07-18)
+    sample_weights.py           Sample/uniqueness weighting
     purged_cv.py                PurgedKFold
   training/
-    trainer.py                  HRWTrainer + ForecastBatch
+    trainer.py                  HRWTrainer + ForecastBatch (opt-in checkpoint_metric)
+    checkpoint_metrics.py       trading_utility_loss: select checkpoints by meta-label
+                                decision-rule net edge rate, not composite loss (2026-07-18)
     train_heads.py              HeadTrainer (freeze_encoder=True default); opt-in via
                                 training.head_finetune_epochs / --head-finetune-epochs (review H7)
     train_world_model.py        WorldModelTrainer + encode_sequence()
   schemas/
     market_schema.py            MarketCandle, FuturesCandle, Regime, RegimeContext, EventContext
-    label_schema.py             LabelRecord, Barrier
-    prediction_schema.py        ModelPrediction, HorizonPrediction
-tests/                          179 unit tests
+    label_schema.py             LabelRecord, Barrier, PRIMARY_SIDE_COLUMN, META_LABEL_COLUMN
+    prediction_schema.py        ModelPrediction, HorizonPrediction (incl. meta_label_prob,
+                                primary_side, quantile_stop/target_return resolvers)
+tests/                          500+ unit tests
 ```
 
 ---
@@ -315,7 +329,7 @@ pip install -e .[dev]
 
 ```bash
 ruff check .
-pytest   # 179 tests, ~27 s
+pytest   # 500+ tests
 ```
 
 ---
@@ -430,15 +444,21 @@ What it does: resample to 5-min, NaN-flag roll gaps, drop HDFC merger blackout b
 
 ### Stage 1 — Create labels
 
+`--data-path` is accepted but ignored (labeling reads alpha_data's continuous futures
+parquet directly, see `alpha_labels.py`'s module docstring) — kept only for CLI/orchestration
+backward compatibility.
+
 ```bash
 python scripts/label.py \
-  --data-path  data/processed/banknifty_5min.parquet \
   --out-path   data/processed/labels.parquet \
-  --H 12 --stop-mult 2.0 --target-mult 2.0
+  --H 48 --stop-mult 1.0 --target-mult 1.0
 ```
 
 Output columns: `barrier`, `exit_return`, `realized_vol`, `label_realized_at`,
-`horizon_bars`, `mae`, `sample_weight`, `regime` (heuristic from `primitives.regime_label`).
+`horizon_bars`, `mae`, `sample_weight`, `regime` (heuristic from `primitives.regime_label`),
+plus `primary_side`/`meta_label` (cost-aware meta-labeling, `LABEL_SCHEMA_VERSION` 9,
+2026-07-18 — see `labeling/meta_labels.py`). `--cost-floor-frac` defaults to this project's
+own `round_trip_cost_frac(CostModelConfig())` (12.98bps as of the 2026-07-18 cost-model audit).
 
 ### Stage 4 — Train forecaster
 
@@ -455,6 +475,15 @@ python scripts/train.py \
   --labels-path     data/processed/labels.parquet \
   --pretrain-epochs 5 \
   --pretrain-gap-bars 2
+
+# Optional (2026-07-18): select checkpoints by the meta-label head's own trading
+# decision rule instead of composite validation loss. Requires labels.parquet to have
+# primary_side/meta_label columns (schema version >= 9).
+python scripts/train.py \
+  --config           configs/v1.yaml \
+  --data-dir         data \
+  --labels-path      data/processed/labels.parquet \
+  --checkpoint-metric trading_utility
 ```
 
 Output: `runs/forecaster.pt` (weights + metadata bundle used by calibrate/backtest/predict).
@@ -480,8 +509,15 @@ python scripts/backtest.py \
   --real      \
   --data-dir  data \
   --model     \
-  --model-path runs/forecaster.pt
+  --model-path runs/forecaster.pt \
+  --stop-target-mode quantile
 ```
+
+`--stop-target-mode quantile` (2026-07-16) sizes stop/target from the model's own predicted
+return-quantile distribution instead of the fixed symmetric barrier multiplier frozen at
+training time — see `docs/investigation_log.md` for why this exists and what it measurably
+changes. `--risk-aversion-lambda` and `--eval-split {train,val,test}` are also available for
+diagnostics; see `scripts/backtest.py --help`.
 
 ### Stage 7 — Predict one timestamp
 
@@ -543,11 +579,16 @@ python scripts/predict.py \
   before trusting calibrated thresholds under the new behavior.
 - **RSSM path**: `HRWWorldModel` and `WorldModelTrainer` are test-covered but not yet wired
   into a CLI training script.
-- **Option surface context (`SURFACE_CONTEXT_FEATURES`, 12-wide as of 2026-07-16)** is not shown
-  in the architecture diagram above, which predates it. It includes ATM call/put delta
-  (`atm_call_delta`/`atm_put_delta`, ranked #1/#2 of 124 features by IC — see
+- **Option surface context (`SURFACE_CONTEXT_FEATURES`, 12-wide as of 2026-07-16)** includes ATM
+  call/put delta (`atm_call_delta`/`atm_put_delta`, ranked #1/#2 of 124 features by IC — see
   `docs/investigation_log.md` §2 item 9), sourced via
   `data/alpha_option_chain.py::AlphaDataAtmGreeksLoader` with a local per-snapshot fallback.
   `ARTIFACT_VERSION` bumped 15→16 for this change (a genuine 10→12 shape change, unlike the
   same-width 14→15 cross-pair swap) — artifacts trained before this bump cannot be loaded
   (`state_dict` shape mismatch on `option_surface_encoder.context.0.weight`).
+- **Meta-labeling is opt-in, not the default decision path (2026-07-18)**: `MetaLabelHead` is
+  always trained (part of the composite loss whenever `meta_label` is present in the batch) and
+  always emits `meta_label_prob`/`primary_side` on every prediction, but it only affects trading
+  decisions via `PositionSizer`'s confidence gate — it does not replace the barrier-head/CVaR
+  decision path. A genuine multi-seed ensemble predictor (averaging multiple checkpoints'
+  predictions at inference) was not implemented this session — see `docs/investigation_log.md` §6.
